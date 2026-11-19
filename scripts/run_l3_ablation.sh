@@ -48,12 +48,16 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 PILOT_MANIFEST_SHA256="${PILOT_MANIFEST_SHA256:-cf1755261b5d5bba6910e74b47e52cc2d6506a3e2edd79fa0012e691f6c7a04a}"
 EPISODE_MANIFEST="${EPISODE_MANIFEST:-}"
 EXPECTED_EPISODE_MANIFEST_SHA256="${EXPECTED_EPISODE_MANIFEST_SHA256:-30260e81e98a0f368cc214b095d9f1c4c43a65e7332e2dc6d7f89e80ae9eac98}"
+FIXED_EPISODE_MANIFEST_SHA256="30260e81e98a0f368cc214b095d9f1c4c43a65e7332e2dc6d7f89e80ae9eac98"
 PARENT_MANIFEST="${PARENT_MANIFEST:-}"
 EXPECTED_PARENT_SHA256="${EXPECTED_PARENT_SHA256:-}"
 COMPLETION_MARKER="${COMPLETION_MARKER:-}"
 CONFIRM="${CONFIRM:-NO}"
+if [ "$EXPECTED_EPISODE_MANIFEST_SHA256" != "$FIXED_EPISODE_MANIFEST_SHA256" ]; then
+    die "EXPECTED_EPISODE_MANIFEST_SHA256 is fixed to the historical canonical digest $FIXED_EPISODE_MANIFEST_SHA256; overriding it is not allowed for the formal run"
+fi
 if [ "$CONFIRM" = "YES" ] && [ -z "$EPISODE_MANIFEST" ]; then
-    die "CONFIRM=YES requires EPISODE_MANIFEST: the historical episode_manifest.json is needed to verify canonical digest 30260e... and the ordered 88 Episodes; a Pilot-only run is not a formal run"
+    die "CONFIRM=YES requires EPISODE_MANIFEST: the historical episode_manifest.json is needed to verify canonical digest 30260e..., the strict 88-Episode set and the historical execution order; a Pilot-only run is not a formal run"
 fi
 if [ -n "${EXPECTED_SHA256:-}" ] && [ "$EXPECTED_SHA256" != "$PILOT_MANIFEST_SHA256" ]; then
     die "EXPECTED_SHA256 is the old ambiguous name; set PILOT_MANIFEST_SHA256 to the raw pilot file digest and EXPECTED_EPISODE_MANIFEST_SHA256 to the canonical marker digest"
@@ -195,7 +199,7 @@ To run both groups and build the paired report, re-run with:
   bash scripts/run_l3_ablation.sh
 
 EPISODE_MANIFEST is mandatory for CONFIRM=YES: it verifies the historical
-canonical digest 30260e... and the ordered 88 Scene/Episode identities.
+canonical digest 30260e..., the 88-Episode set and the historical execution order.
 EOF
     exit 0
 fi
@@ -203,17 +207,32 @@ fi
 run_group uninavid_baseline
 run_group uninavid_l3_only
 
+PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+EXPECTED_EPISODE_MANIFEST_SHA256="$EXPECTED_EPISODE_MANIFEST_SHA256" \
 "$PYTHON_BIN" - "$OUTPUT_ROOT" <<'PY' || die "result completeness check failed"
-import json, sys
+import json, os, sys
 from pathlib import Path
+from l3_integration.pilot_manifest import load_episode_manifest
 root = Path(sys.argv[1])
+expected = os.environ["EXPECTED_EPISODE_MANIFEST_SHA256"]
 for group in ("uninavid_baseline", "uninavid_l3_only"):
     path = root / group / "results.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     keys = {(r["scene_basename"], r["episode_id"]) for r in rows}
-    if len(keys) != 88:
-        raise SystemExit(f"{group}: {len(keys)} unique Episodes, expected 88 ({path})")
-    print(group, len(keys), "unique Episodes")
+    if len(rows) != 88 or len(keys) != 88:
+        raise SystemExit(
+            f"{group}: {len(rows)} rows / {len(keys)} unique Episodes, "
+            f"expected 88 ({path})"
+        )
+    execution_path = root / group / "execution_manifest.json"
+    if not execution_path.is_file():
+        raise SystemExit(f"{group}: execution manifest missing ({execution_path})")
+    execution = load_episode_manifest(
+        execution_path, expected_canonical_sha256=expected,
+    )
+    if execution.expected_count != 88 or set(execution.keys()) != keys:
+        raise SystemExit(f"{group}: execution manifest/result Episode set differs")
+    print(group, len(keys), "unique Episodes; execution manifest digest verified")
 PY
 
 "$PYTHON_BIN" scripts/build_l3_report.py \

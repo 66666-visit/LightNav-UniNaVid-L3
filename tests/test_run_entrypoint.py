@@ -136,6 +136,84 @@ def test_run_exp_gives_both_groups_the_same_episode_sequence(run_module, tmp_pat
     )
 
 
+def test_run_exp_uses_historical_episode_manifest_order(
+    run_module, tmp_path,
+) -> None:
+    run, manifest_path, digest, calls = run_module
+    pilot = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rows = [
+        {"scene_id": row["scene_id"], "episode_id": row["habitat_episode_id"]}
+        for row in pilot["episodes"]
+    ][::-1]
+    data = {"split": "val_unseen", "expected_count": 88, "episodes": rows}
+    episode_path = tmp_path / "episode_manifest.json"
+    episode_path.write_text(json.dumps(data), encoding="utf-8")
+    canonical = canonical_episode_manifest_sha256(data)
+    result_path = tmp_path / "result"
+
+    run_kwargs = dict(
+        exp_config="fake.yaml", split_num=1, split_id=0, model_path="model",
+        result_path=str(result_path), model_name="uni-navid",
+        exp_save="data", pilot_manifest=str(manifest_path),
+        pilot_sha256=digest, expected_episodes=88,
+        episode_manifest=str(episode_path),
+        episode_manifest_sha256=canonical,
+        require_episode_manifest=True,
+        allow_nonpilot_eval=True,
+        experiment_group="uninavid_baseline",
+    )
+    run.run_exp(**run_kwargs)
+    assert len(calls) == 1
+    dataset, kwargs = calls[0]
+    assert [episode.episode_id for episode in dataset.episodes] == [
+        row["episode_id"] for row in rows
+    ]
+    assert [episode.episode_id for episode in dataset.episodes] != [
+        row["habitat_episode_id"] for row in pilot["episodes"]
+    ]
+    manifest_audit = kwargs["manifest_audit"]
+    comparison = manifest_audit["episode_manifest"]["pilot_comparison"]
+    assert comparison["sets_equal"] is True
+    assert comparison["order_matches"] is False
+    assert manifest_audit["execution_manifest"]["aligned"] is True
+    assert manifest_audit["execution_order"] == "episode_manifest.json"
+    assert (
+        manifest_audit["pilot_order_digest_with_instructions"]
+        != manifest_audit["dataset_order_digest_with_instructions"]
+    )
+    assert kwargs["execution_manifest"] is not None
+
+    generated = json.loads(
+        (result_path / "execution_manifest.json").read_text(encoding="utf-8")
+    )
+    assert canonical_episode_manifest_sha256(generated) == canonical
+    assert [row["episode_id"] for row in generated["episodes"]] == [
+        row["episode_id"] for row in rows
+    ]
+    pilot_by_id = {
+        row["habitat_episode_id"]: row["distance_group"]
+        for row in pilot["episodes"]
+    }
+    assert [row["distance_group"] for row in generated["episodes"]] == [
+        pilot_by_id[row["episode_id"]] for row in rows
+    ]
+    alignment = json.loads(
+        (result_path / "manifest_alignment.json").read_text(encoding="utf-8")
+    )
+    assert alignment["aligned"] is True
+    assert alignment["pilot_comparison"]["order_matches"] is False
+
+    # A second shard must verify the same execution manifest and alignment
+    # file instead of rewriting or rejecting them.
+    run.run_exp(**run_kwargs)
+    assert len(calls) == 2
+    assert canonical_episode_manifest_sha256(
+        json.loads(
+            (result_path / "execution_manifest.json").read_text(encoding="utf-8")
+        )
+    ) == canonical
+
+
 def test_formal_uninavid_run_requires_the_frozen_manifest_and_digest(
     run_module, tmp_path,
 ) -> None:
@@ -162,12 +240,36 @@ def test_formal_uninavid_run_requires_the_frozen_manifest_and_digest(
             ),
             expected_episodes=87,
         )
+    with pytest.raises(ValueError, match="episode-manifest-sha256"):
+        run.run_exp(
+            **common, experiment_group="uninavid_baseline",
+            pilot_manifest=str(manifest_path),
+            pilot_sha256=(
+                "cf1755261b5d5bba6910e74b47e52cc2d6506a3e2edd79fa0012e691f6c7a04a"
+            ),
+            expected_episodes=88, episode_manifest="fake-episode-manifest.json",
+            episode_manifest_sha256="0" * 64,
+        )
     assert calls == []
     run.run_exp(
         **common, experiment_group="uninavid_baseline",
         allow_nonpilot_eval=True,
     )
     assert len(calls) == 1
+
+
+def test_write_run_metadata_roundtrips_tuples_idempotently(
+    run_module, tmp_path,
+) -> None:
+    run, *_ = run_module
+    path = tmp_path / "manifest_alignment.json"
+    metadata = {"comparison": {"first_key": ("Scene0.glb", "ep-0")}}
+    run._write_run_metadata(str(path), metadata)
+    # A second shard must compare equal after the first write's JSON round-trip.
+    run._write_run_metadata(str(path), metadata)
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "comparison": {"first_key": ["Scene0.glb", "ep-0"]},
+    }
 
 
 def test_episode_seed_is_deterministic_and_episode_specific(run_module) -> None:
@@ -339,7 +441,13 @@ def test_formal_path_accepts_exact_frozen_manifest(run_module, monkeypatch) -> N
     frozen = "cf1755261b5d5bba6910e74b47e52cc2d6506a3e2edd79fa0012e691f6c7a04a"
 
     class FakeManifest:
-        rows = [object()] * 88
+        rows = [
+            SimpleNamespace(
+                scene_basename=f"Scene{scene}.glb",
+                episode_id=f"ep-{scene}-{index}",
+            )
+            for scene in range(11) for index in range(8)
+        ]
 
         def order_digest(self, instructions=None):
             return "fake-order-digest"
@@ -348,7 +456,8 @@ def test_formal_path_accepts_exact_frozen_manifest(run_module, monkeypatch) -> N
         run, "load_pilot_manifest", lambda *a, **k: FakeManifest(),
     )
     monkeypatch.setattr(
-        run, "select_pilot_episodes", lambda episodes, manifest: list(episodes),
+        run, "select_pilot_episodes",
+        lambda episodes, manifest, **kwargs: list(episodes),
     )
     monkeypatch.setattr(
         run, "audit_manifest", lambda *a, **k: {

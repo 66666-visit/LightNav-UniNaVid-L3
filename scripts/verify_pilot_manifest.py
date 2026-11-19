@@ -141,7 +141,10 @@ def main(argv: list[str] | None = None) -> int:
             "bypass the historical completion-marker digest"
         )
     if args.episode_manifest and not args.manifest:
-        parser.error("--episode-manifest requires --manifest for order comparison")
+        parser.error(
+            "--episode-manifest requires --manifest for the strict "
+            "88-Episode set comparison"
+        )
     if args.require_episode_manifest and not args.episode_manifest:
         print(
             "BLOCKED: --require-episode-manifest was set but "
@@ -241,10 +244,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         episode = report.get("episode_manifest", {})
         if episode.get("verified"):
+            comparison = episode.get("pilot_comparison", {})
             print(
                 "episode_manifest canonical_sha256="
                 f"{episode.get('canonical_sha256')} (file SHA256="
-                f"{episode.get('file_sha256')})",
+                f"{episode.get('file_sha256')}); set_match="
+                f"{comparison.get('sets_equal')} order_matches_pilot="
+                f"{comparison.get('order_matches')} execution_order="
+                f"{comparison.get('order_source')}",
                 file=sys.stderr,
             )
         else:

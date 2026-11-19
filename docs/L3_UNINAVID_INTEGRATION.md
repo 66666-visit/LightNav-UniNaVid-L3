@@ -12,15 +12,26 @@ The model weights, visual input path, `<video_special>` / `<image_special>` /
 are unchanged. The only behavioural change is the text placed inside the
 official template's single `{}` task slot.
 
-**Current blocker:** the fixed `pilot_manifest.json` (raw-file SHA256
+**Manifest alignment fixed; input blocker remains:** the fixed
+`pilot_manifest.json` (raw-file SHA256
 `cf1755261b5d5bba6910e74b47e52cc2d6506a3e2edd79fa0012e691f6c7a04a`) and the
 evaluation `episode_manifest.json` (canonical completion-marker digest
-`30260e81e98a0f368cc214b095d9f1c4c43a65e7332e2dc6d7f89e80ae9eac98`) are not
-present under any accessible path in `/home/lilixing/projects`. The
+`30260e81e98a0f368cc214b095d9f1c4c43a65e7332e2dc6d7f89e80ae9eac98`) are still
+not present under any accessible path in `/home/lilixing/projects`. The
 `/root/autodl-tmp/...` path named in the task is not readable from this
 environment. These are two different digests over two different files; the
 code checks each with its own algorithm and fails closed if either is absent or
 differs. No replacement manifest was generated.
+
+The 88-Episode alignment bug is fixed: the Pilot and the historical
+`episode_manifest.json` are no longer compared position-by-position. Their
+`(scene_basename, episode_id)` sets must match exactly, and the historical
+manifest's order is the execution order. Pilot metadata (`distance_group`,
+`instruction`, …) is indexed by that key, so a different order cannot attach a
+wrong group or instruction. At run time, `execution_manifest.json` is generated
+in the historical order and its canonical JSON digest is verified against the
+historical `30260e...` completion-marker digest. The two input files are still
+opened read-only and their bytes are never rewritten.
 
 **Not yet run:** real Habitat + Uni-NaVid + YOLO11n-seg smoke test. The local
 machine has neither the Habitat environment nor GPU/checkpoints. A synthetic
@@ -285,11 +296,28 @@ is the only opt-out and is used by the legacy full-split helper
 - requires exactly 88 unique Episodes, 11 scenes, 8 per scene;
 - validates 3/3/2 short/medium/long strata when `distance_group` is present;
 - verifies the supplied **Pilot file raw SHA256** against the frozen value;
+- verifies the historical `episode_manifest.json` with its **canonical JSON
+  SHA256** (the `pilot_complete.json` marker digest), separately from the Pilot
+  file hash;
+- compares the two manifests as **strict sets** of
+  `(scene_basename, episode_id)`; a different order is accepted, while a
+  missing, extra, duplicate, wrong-count or wrong-scene Episode fails closed;
+- uses the historical `episode_manifest.json` order as the execution order and
+  indexes Pilot metadata (`distance_group`, `instruction`, …) by Episode key,
+  never by list position;
 - matches dataset Episodes by unique scene basename + Episode ID (manifest and
   Habitat run may use different path prefixes);
-- preserves manifest order and compares instructions when the manifest carries
-  them;
-- never samples, reorders or substitutes; missing file/SHA/ID is a hard error;
+- writes `execution_manifest.json` in the historical order and verifies that
+  recomputing its canonical digest reproduces the historical `30260e...`
+  value; `manifest_alignment.json` records both fixed hashes and the set/order
+  comparison;
+- with `CHUNKS>1`, each shard keeps the historical relative order and both
+  groups use identical sharding; `results.jsonl` concatenates shard-major,
+  while `execution_manifest.json` and `manifest_order_index` retain the global
+  historical order;
+- never samples, randomly reorders, replaces Episodes or rewrites
+  instructions; missing file/SHA/ID is a hard error and the two input files are
+  never rewritten;
 - is mandatory in `run.py` for `uni-navid` unless the explicit
   `--allow-nonpilot-eval` legacy flag is set;
 - an unreadable path is reported as a blocker (not as a missing file to
@@ -311,10 +339,12 @@ must not be used for the episode manifest.
 
 The Pilot file and the evaluation `episode_manifest.json` are **absent
 locally**. `scripts/verify_pilot_manifest.py` is the preflight; it reports the
-missing files instead of generating them. Supply both to verify the 88 ordered
-Scene/Episode identities and the historical marker digest. `COMPLETION_MARKER`
-is the historical `pilot_complete.json` under the AutoDL group directory; its
-path must be discovered, not assumed:
+missing files instead of generating them. Supply both to verify the historical
+marker digest, the strict 88-Episode set and the historical execution order
+(`set_match=true`, `order_matches_pilot` reported, execution order always the
+historical manifest). `COMPLETION_MARKER` is the historical
+`pilot_complete.json` under the AutoDL group directory; its path must be
+discovered, not assumed:
 
 ```bash
 python scripts/verify_pilot_manifest.py \
@@ -343,7 +373,7 @@ PYTHONPATH=.:/home/lilixing/projects/LightNav-0-codex/.venv/lib/python3.11/site-
   -m pytest -q tests
 ```
 
-Result on 2026-11-19: **120 passed** in ~3.6 s (plus an unrelated
+Result on 2026-11-19: **134 passed** in ~4.0 s (plus an unrelated
 `pytest_asyncio` deprecation warning from the environment).
 
 Coverage map:
@@ -364,6 +394,12 @@ Coverage map:
 | formal run fails closed without manifest/SHA/88 | `tests/test_run_entrypoint.py` |
 | prompt audit real path / A-B task slot | `tests/test_prompt_audit.py` |
 | Pilot vs parent vs episode-manifest hashes | `tests/test_pilot_manifest.py` |
+| same 88-set with different order PASS | `tests/test_pilot_manifest.py`, `tests/test_run_entrypoint.py` |
+| missing / extra / duplicate Episode FAIL | `tests/test_pilot_manifest.py` |
+| `distance_group` keyed by Episode ID, not position | `tests/test_pilot_manifest.py` |
+| execution order equals historical manifest order | `tests/test_pilot_manifest.py`, `tests/test_run_entrypoint.py` |
+| generated execution manifest reproduces historical canonical digest | `tests/test_pilot_manifest.py`, `tests/test_run_entrypoint.py` |
+| both input files and their fixed hashes unchanged | `tests/test_pilot_manifest.py` |
 | L3 compute cannot advance model RNG | `tests/test_agent_contract.py` |
 | A/B same Episode IDs | `tests/test_pilot_manifest.py`, `tests/test_run_entrypoint.py` |
 | no GT/oracle/future info | `tests/test_no_l1_no_oracle.py` |

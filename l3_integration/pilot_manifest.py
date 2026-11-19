@@ -89,6 +89,10 @@ class PilotManifest:
     def keys(self) -> tuple[tuple[str, str], ...]:
         return tuple((row.scene_basename, row.episode_id) for row in self.rows)
 
+    def index(self) -> dict[tuple[str, str], PilotRow]:
+        """Index Pilot metadata by Episode identity, never by list position."""
+        return {(row.scene_basename, row.episode_id): row for row in self.rows}
+
     def scene_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for row in self.rows:
@@ -332,41 +336,428 @@ def load_episode_manifest(
     )
 
 
-def compare_episode_manifest_to_pilot(
+@dataclass(frozen=True)
+class ExecutionRow:
+    """One pilot Episode in the historical evaluation manifest's order.
+
+    ``scene_id`` is kept byte-for-byte as stored in the historical
+    ``episode_manifest.json`` so that the generated execution manifest
+    reproduces its canonical digest.  Pilot metadata (``distance_group`` and
+    ``instruction``) is attached through ``(scene_basename, episode_id)``;
+    ``pilot_index`` is diagnostic only and is never used for association.
+    """
+
+    scene_id: str
+    episode_id: str
+    distance_group: str | None
+    instruction: str | None
+    pilot_scene_id: str
+    pilot_index: int
+    execution_index: int
+
+    @property
+    def scene_basename(self) -> str:
+        return scene_basename(self.scene_id)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.scene_basename, self.episode_id)
+
+    def canonical_entry(self) -> dict[str, str]:
+        """The only fields LightNav's completion marker hashes."""
+        return {"scene_id": self.scene_id, "episode_id": self.episode_id}
+
+    def manifest_entry(self) -> dict[str, Any]:
+        """Execution row with Pilot metadata, for the generated artifact."""
+        entry: dict[str, Any] = self.canonical_entry()
+        if self.distance_group is not None:
+            entry["distance_group"] = self.distance_group
+        if self.instruction is not None:
+            entry["instruction"] = self.instruction
+        return entry
+
+    def audit(self) -> dict[str, Any]:
+        return {
+            "scene_id": self.scene_id,
+            "episode_id": self.episode_id,
+            "scene_basename": self.scene_basename,
+            "pilot_scene_id": self.pilot_scene_id,
+            "distance_group": self.distance_group,
+            "instruction": self.instruction,
+            "execution_index": self.execution_index,
+            "pilot_index": self.pilot_index,
+        }
+
+
+@dataclass(frozen=True)
+class ExecutionManifest:
+    """Execution plan: historical Episode order plus Pilot metadata by key."""
+
+    episode: EpisodeManifest
+    pilot: PilotManifest
+    rows: tuple[ExecutionRow, ...]
+    canonical_sha256: str
+    order_source: str = "episode_manifest.json"
+
+    def keys(self) -> tuple[tuple[str, str], ...]:
+        return tuple(row.key for row in self.rows)
+
+    def index(self) -> dict[tuple[str, str], ExecutionRow]:
+        return {row.key: row for row in self.rows}
+
+    def scene_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in self.rows:
+            counts[row.scene_basename] = counts.get(row.scene_basename, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def strata_counts(self) -> dict[str, dict[str, int]]:
+        counts: dict[str, dict[str, int]] = {}
+        for row in self.rows:
+            if row.distance_group is None:
+                continue
+            scene = counts.setdefault(
+                row.scene_basename, {"short": 0, "medium": 0, "long": 0},
+            )
+            scene[row.distance_group] += 1
+        return dict(sorted(counts.items()))
+
+    def canonical_payload(self) -> dict[str, Any]:
+        return {
+            "split": self.episode.split,
+            "expected_count": len(self.rows),
+            "episodes": [row.canonical_entry() for row in self.rows],
+        }
+
+    def manifest_payload(self) -> dict[str, Any]:
+        """JSON-safe artifact; unknown top-level keys do not change the digest."""
+        return {
+            "split": self.episode.split,
+            "expected_count": len(self.rows),
+            "episodes": [row.manifest_entry() for row in self.rows],
+            "execution_order": self.order_source,
+            "pilot_manifest_file_sha256": self.pilot.file_sha256,
+            "episode_manifest_file_sha256": self.episode.file_sha256,
+            "episode_manifest_canonical_sha256": self.episode.canonical_sha256,
+            "execution_manifest_canonical_sha256": self.canonical_sha256,
+            "execution_identity_digest": self.order_digest(),
+        }
+
+    def order_digest(self, instructions: Iterable[str] | None = None) -> str:
+        return order_digest(self.rows, instructions=instructions)
+
+    def comparison(self) -> dict[str, Any]:
+        """Report a strict set match while retaining both orders."""
+        episode_keys = _unique_keys(
+            self.keys(), manifest_name="execution manifest",
+        )
+        pilot_keys = _unique_keys(
+            self.pilot.keys(), manifest_name="pilot manifest",
+        )
+        if len(episode_keys) != EXPECTED_EPISODES:
+            raise PilotManifestError(
+                f"execution manifest has {len(episode_keys)} Episodes; "
+                f"expected {EXPECTED_EPISODES}"
+            )
+        if len(pilot_keys) != EXPECTED_EPISODES:
+            raise PilotManifestError(
+                f"pilot manifest has {len(pilot_keys)} Episodes; "
+                f"expected {EXPECTED_EPISODES}"
+            )
+        episode_set = set(episode_keys)
+        pilot_set = set(pilot_keys)
+        missing = [key for key in pilot_keys if key not in episode_set]
+        extra = [key for key in episode_keys if key not in pilot_set]
+        if missing or extra:
+            raise PilotManifestError(
+                "execution manifest Episode set differs from the Pilot: "
+                f"missing={missing[:5]}, extra={extra[:5]}"
+            )
+        order_matches = episode_keys == pilot_keys
+        return {
+            "match": True,
+            "sets_equal": True,
+            "count": len(episode_keys),
+            "pilot_count": len(pilot_keys),
+            "missing_count": 0,
+            "extra_count": 0,
+            "order_matches": order_matches,
+            "order_relation": (
+                "same_order" if order_matches else "same_set_different_order"
+            ),
+            "order_source": self.order_source,
+            "execution_order": "episode_manifest.json order preserved",
+            "pilot_order": "pilot_manifest.episodes order; metadata only",
+            "first_key": episode_keys[0],
+            "last_key": episode_keys[-1],
+            "pilot_scene_counts": self.pilot.scene_counts(),
+            "episode_scene_counts": self.episode.scene_counts(),
+            "execution_scene_counts": self.scene_counts(),
+            "pilot_identity_digest": order_digest(self.pilot.rows),
+            "execution_identity_digest": self.order_digest(),
+        }
+
+    def audit(self) -> dict[str, Any]:
+        aligned = self.canonical_sha256 == self.episode.canonical_sha256
+        return {
+            "order_source": self.order_source,
+            "digest_kind": (
+                "canonical JSON SHA256 used by pilot_complete.json"
+                "['manifest_sha256'], computed after reordering into the "
+                "historical episode_manifest.json order; not a file SHA256"
+            ),
+            "count": len(self.rows),
+            "pilot_count": len(self.pilot.rows),
+            "canonical_sha256": self.canonical_sha256,
+            "historical_episode_manifest_canonical_sha256": (
+                self.episode.canonical_sha256
+            ),
+            "aligned": aligned,
+            "pilot_file_sha256": self.pilot.file_sha256,
+            "episode_file_sha256": self.episode.file_sha256,
+            "order_matches_pilot": self.keys() == self.pilot.keys(),
+            "pilot_identity_digest": order_digest(self.pilot.rows),
+            "execution_identity_digest": self.order_digest(),
+            "scene_counts": self.scene_counts(),
+            "strata_counts": self.strata_counts(),
+            "episodes": [row.audit() for row in self.rows],
+        }
+
+
+def _unique_keys(
+    keys: Iterable[tuple[str, str]], *, manifest_name: str,
+) -> tuple[tuple[str, str], ...]:
+    values = tuple(keys)
+    seen: set[tuple[str, str]] = set()
+    duplicates: list[tuple[str, str]] = []
+    for key in values:
+        if key in seen and key not in duplicates:
+            duplicates.append(key)
+        seen.add(key)
+    if duplicates:
+        raise PilotManifestError(
+            f"{manifest_name} has duplicate Episode identities: {duplicates[:5]}"
+        )
+    return values
+
+
+def build_execution_manifest(
     episode: EpisodeManifest, pilot: PilotManifest,
-) -> dict[str, Any]:
-    """Require the exact 88 ordered (scene basename, Episode ID) identities."""
+) -> ExecutionManifest:
+    """Reconcile the historical manifest with the Pilot by Episode identity.
+
+    The Episode **set** must match exactly; order is deliberately ignored.  The
+    historical ``episode_manifest.json`` order is the execution order, and
+    every Pilot metadata field is looked up by
+    ``(scene_basename, episode_id)`` rather than by list position.
+    """
     if episode.split != "val_unseen":
         raise PilotManifestError(
             f"episode manifest split must be val_unseen; got {episode.split!r}"
         )
-    expected = pilot.keys()
-    actual = episode.keys()
-    if len(expected) != EXPECTED_EPISODES:
+    if pilot.dataset_split not in (None, "val_unseen"):
         raise PilotManifestError(
-            f"pilot manifest has {len(expected)} Episodes; expected "
+            f"pilot manifest split must be val_unseen; got {pilot.dataset_split!r}"
+        )
+    if (
+        len(episode.rows) != EXPECTED_EPISODES
+        or episode.expected_count != EXPECTED_EPISODES
+    ):
+        raise PilotManifestError(
+            f"episode manifest has {len(episode.rows)} Episodes; expected "
             f"{EXPECTED_EPISODES}"
         )
-    if len(actual) != EXPECTED_EPISODES:
+    if (
+        len(pilot.rows) != EXPECTED_EPISODES
+        or pilot.expected_count != EXPECTED_EPISODES
+    ):
         raise PilotManifestError(
-            f"episode manifest has {len(actual)} Episodes; expected "
+            f"pilot manifest has {len(pilot.rows)} Episodes; expected "
             f"{EXPECTED_EPISODES}"
         )
-    for index, (pilot_key, episode_key) in enumerate(zip(expected, actual)):
-        if pilot_key != episode_key:
+    episode_keys = _unique_keys(episode.keys(), manifest_name="episode manifest")
+    pilot_keys = _unique_keys(pilot.keys(), manifest_name="pilot manifest")
+    episode_set = set(episode_keys)
+    pilot_set = set(pilot_keys)
+    missing = [key for key in pilot_keys if key not in episode_set]
+    extra = [key for key in episode_keys if key not in pilot_set]
+    if missing or extra:
+        raise PilotManifestError(
+            "episode manifest Episode set differs from the Pilot: "
+            f"missing={missing[:5]}, extra={extra[:5]}"
+        )
+
+    episode_scenes = episode.scene_counts()
+    pilot_scenes = pilot.scene_counts()
+    if len(episode_scenes) != EXPECTED_SCENES:
+        raise PilotManifestError(
+            f"episode manifest must cover {EXPECTED_SCENES} scenes; "
+            f"found {len(episode_scenes)}"
+        )
+    if set(episode_scenes) != set(pilot_scenes):
+        raise PilotManifestError(
+            "episode manifest scene coverage differs from the Pilot: "
+            f"episode={sorted(episode_scenes)}, pilot={sorted(pilot_scenes)}"
+        )
+    if any(count != EXPECTED_PER_SCENE for count in episode_scenes.values()):
+        raise PilotManifestError(
+            f"episode manifest must contain {EXPECTED_PER_SCENE} Episodes per "
+            f"scene; found {episode_scenes}"
+        )
+    if pilot_scenes != episode_scenes:
+        raise PilotManifestError(
+            "episode manifest per-scene counts differ from the Pilot: "
+            f"episode={episode_scenes}, pilot={pilot_scenes}"
+        )
+
+    pilot_rows_by_key = pilot.index()
+    pilot_positions = {
+        (row.scene_basename, row.episode_id): position
+        for position, row in enumerate(pilot.rows)
+    }
+    rows: list[ExecutionRow] = []
+    for execution_index, episode_row in enumerate(episode.rows):
+        key = (episode_row.scene_basename, episode_row.episode_id)
+        pilot_row = pilot_rows_by_key[key]
+        rows.append(ExecutionRow(
+            scene_id=episode_row.scene_id,
+            episode_id=episode_row.episode_id,
+            distance_group=pilot_row.distance_group,
+            instruction=pilot_row.instruction,
+            pilot_scene_id=pilot_row.scene_id,
+            pilot_index=pilot_positions[key],
+            execution_index=execution_index,
+        ))
+
+    canonical_payload = {
+        "split": episode.split,
+        "expected_count": len(rows),
+        "episodes": [row.canonical_entry() for row in rows],
+    }
+    digest = canonical_episode_manifest_sha256(canonical_payload)
+    if digest != episode.canonical_sha256:
+        raise PilotManifestError(
+            "generated execution manifest canonical digest does not align "
+            f"with the historical episode_manifest.json: {digest} != "
+            f"{episode.canonical_sha256}"
+        )
+    return ExecutionManifest(
+        episode=episode,
+        pilot=pilot,
+        rows=tuple(rows),
+        canonical_sha256=digest,
+    )
+
+
+def compare_episode_manifest_to_pilot(
+    episode: EpisodeManifest, pilot: PilotManifest,
+) -> dict[str, Any]:
+    """Require the same 88-Episode set, ignoring order, and report both orders.
+
+    A different order is not an error: the historical ``episode_manifest.json``
+    order becomes the execution order.  Missing, extra, duplicate, wrong-count
+    and wrong-scene Episodes still fail closed.
+    """
+    return build_execution_manifest(episode, pilot).comparison()
+
+
+def write_execution_manifest(
+    path: str | Path,
+    execution: ExecutionManifest,
+    *,
+    expected_canonical_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Write the execution manifest once and verify its canonical digest.
+
+    The artifact stores the historical scene path spelling and the historical
+    order, so ``canonical_episode_manifest_sha256`` equals the completion-marker
+    digest.  Pilot metadata is extra JSON and is stripped by the same
+    canonicalisation, so it cannot perturb the digest.
+    """
+    expected = (
+        execution.episode.canonical_sha256
+        if expected_canonical_sha256 is None else expected_canonical_sha256
+    )
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise PilotManifestError(
+            "expected execution manifest digest must be a 64-character digest"
+        )
+    if execution.canonical_sha256 != execution.episode.canonical_sha256:
+        raise PilotManifestError(
+            "execution manifest is not aligned with the historical "
+            "episode_manifest.json canonical digest"
+        )
+    payload = execution.manifest_payload()
+    generated_digest = canonical_episode_manifest_sha256(payload)
+    if generated_digest != expected:
+        raise PilotManifestError(
+            "execution manifest canonical SHA256 mismatch: "
+            f"expected {expected}, got {generated_digest}"
+        )
+    target = Path(path)
+    for source_name, source_path in (
+        ("historical episode_manifest.json", execution.episode.path),
+        ("pilot_manifest.json", execution.pilot.path),
+    ):
+        if target.resolve(strict=False) == source_path.resolve(strict=False):
             raise PilotManifestError(
-                "episode manifest order/identity differs from the Pilot at "
-                f"index {index}: pilot={pilot_key}, episode={episode_key}"
+                f"refusing to overwrite the {source_name}: {target}"
+            )
+    created = False
+    if target.exists():
+        existing = load_episode_manifest(
+            target, expected_canonical_sha256=expected,
+        )
+        if existing.keys() != execution.keys():
+            raise PilotManifestError(
+                f"existing execution manifest has different Episode order/IDs: {target}"
+            )
+        try:
+            existing_payload = json.loads(target.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise PilotManifestError(
+                f"existing execution manifest is not valid JSON: {target}"
+            ) from exc
+        if existing_payload != payload:
+            raise PilotManifestError(
+                "existing execution manifest metadata differs from this run: "
+                f"{target}; use a fresh output directory or remove the stale file"
+            )
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+        try:
+            with target.open("x", encoding="utf-8") as stream:
+                stream.write(text)
+            created = True
+        except FileExistsError:
+            # A concurrent shard created the same deterministic artifact.
+            pass
+        existing = load_episode_manifest(
+            target, expected_canonical_sha256=expected,
+        )
+        if existing.keys() != execution.keys():
+            raise PilotManifestError(
+                "concurrent execution manifest has different Episode "
+                f"order/IDs: {target}"
             )
     return {
-        "match": True,
-        "count": len(actual),
-        "pilot_count": len(expected),
-        "order": "pilot_manifest.episodes order preserved",
-        "first_key": actual[0],
-        "last_key": actual[-1],
-        "pilot_scene_counts": pilot.scene_counts(),
-        "episode_scene_counts": episode.scene_counts(),
+        "path": str(target),
+        "created": created,
+        "verified": True,
+        "aligned": True,
+        "digest_kind": (
+            "canonical JSON SHA256 used by pilot_complete.json"
+            "['manifest_sha256']; not a file SHA256"
+        ),
+        "canonical_sha256": existing.canonical_sha256,
+        "historical_episode_manifest_canonical_sha256": (
+            execution.episode.canonical_sha256
+        ),
+        "expected_canonical_sha256": expected,
+        "file_sha256": existing.file_sha256,
+        "count": len(existing.rows),
+        "order_source": execution.order_source,
     }
 
 
@@ -650,26 +1041,42 @@ def select_pilot_episodes(
     manifest: PilotManifest,
     *,
     check_instruction: bool = True,
+    execution_manifest: ExecutionManifest | None = None,
 ) -> list[Any]:
-    """Return the actual dataset Episodes in manifest order.
+    """Return the actual dataset Episodes in execution order.
 
-    This is the only selection path used by both experiment groups.  It never
-    samples, sorts or substitutes.  A missing key is a hard failure.
+    With an ``ExecutionManifest`` (the formal path), the historical
+    ``episode_manifest.json`` order is used.  Without one, Pilot order is kept
+    for the Pilot-only preflight.  This is the only selection path used by both
+    experiment groups.  It never samples, sorts or substitutes.  A missing key
+    is a hard failure.
     """
+    if execution_manifest is not None:
+        if execution_manifest.pilot.keys() != manifest.keys():
+            raise PilotManifestError(
+                "execution manifest was built from a different Pilot manifest"
+            )
+        if (
+            execution_manifest.canonical_sha256
+            != execution_manifest.episode.canonical_sha256
+        ):
+            raise PilotManifestError(
+                "execution manifest does not reproduce the historical "
+                "episode_manifest.json canonical digest"
+            )
+        order_rows: Iterable[PilotRow | ExecutionRow] = execution_manifest.rows
+    else:
+        order_rows = manifest.rows
     index = _dataset_index(dataset_episodes)
     selected: list[Any] = []
     missing: list[tuple[str, str]] = []
-    for row in manifest.rows:
+    for row in order_rows:
         key = (row.scene_basename, row.episode_id)
         episode = index.get(key)
         if episode is None:
             missing.append(key)
             continue
-        if (
-            check_instruction
-            and manifest.instructions_available
-            and row.instruction is not None
-        ):
+        if check_instruction and row.instruction is not None:
             actual = episode_instruction(episode)
             if actual != row.instruction:
                 raise PilotManifestError(
@@ -690,7 +1097,8 @@ def select_pilot_episodes(
 
 
 def order_digest(
-    rows: Iterable[PilotRow], *, instructions: Iterable[str] | None = None,
+    rows: Iterable[PilotRow | ExecutionRow],
+    *, instructions: Iterable[str] | None = None,
 ) -> str:
     """Digest ordered (scene basename, Episode ID, instruction) identities."""
     values = list(instructions) if instructions is not None else None
@@ -718,6 +1126,7 @@ def audit_manifest(
     expected_episode_manifest_sha256: str | None = (
         EXPECTED_EPISODE_MANIFEST_SHA256
     ),
+    execution_manifest: ExecutionManifest | None = None,
     parent_manifest: str | Path | None = None,
     expected_parent_manifest_sha256: str | None = None,
 ) -> dict[str, Any]:
@@ -730,7 +1139,16 @@ def audit_manifest(
     * Episode: the canonical JSON SHA256 used by the historical
       ``pilot_complete.json`` marker, verified by
       :func:`load_episode_manifest`, not by ``sha256sum``.
+
+    When the episode manifest is supplied, its Episode set is compared to the
+    Pilot as a set and its order becomes the execution order.  The generated
+    execution manifest is reported with the same canonical digest as the
+    historical file.
     """
+    if execution_manifest is not None and episode_manifest is None:
+        raise PilotManifestError(
+            "an execution manifest requires the historical episode_manifest.json"
+        )
     manifest = load_pilot_manifest(path, expected_sha256=expected_sha256)
     report = manifest.audit()
 
@@ -773,12 +1191,26 @@ def audit_manifest(
             ),
         }
 
+    execution: ExecutionManifest | None = None
     if episode_manifest is not None:
         episode = load_episode_manifest(
             episode_manifest,
             expected_canonical_sha256=expected_episode_manifest_sha256,
         )
-        comparison = compare_episode_manifest_to_pilot(episode, manifest)
+        if execution_manifest is None:
+            execution = build_execution_manifest(episode, manifest)
+        else:
+            execution = execution_manifest
+            if (
+                execution.episode.file_sha256 != episode.file_sha256
+                or execution.episode.canonical_sha256 != episode.canonical_sha256
+                or execution.pilot.file_sha256 != manifest.file_sha256
+            ):
+                raise PilotManifestError(
+                    "supplied execution manifest does not belong to the "
+                    "verified pilot/episode manifests"
+                )
+        comparison = execution.comparison()
         episode_report = episode.audit()
         episode_report.update({
             "expected_canonical_sha256": expected_episode_manifest_sha256,
@@ -786,6 +1218,7 @@ def audit_manifest(
             "pilot_comparison": comparison,
         })
         report["episode_manifest"] = episode_report
+        report["execution_manifest"] = execution.audit()
     else:
         report["episode_manifest"] = {
             "path": None,
@@ -802,10 +1235,16 @@ def audit_manifest(
                 "marker digest cannot be verified from the Pilot file alone"
             ),
         }
+        report["execution_manifest"] = None
 
     if dataset_episodes is not None:
-        selected = select_pilot_episodes(dataset_episodes, manifest)
+        selected = select_pilot_episodes(
+            dataset_episodes, manifest, execution_manifest=execution,
+        )
         instructions = [episode_instruction(episode) for episode in selected]
+        order_rows: Iterable[PilotRow | ExecutionRow] = (
+            execution.rows if execution is not None else manifest.rows
+        )
         report["dataset_match"] = True
         report["dataset_count"] = len(selected)
         report["dataset_episode_keys"] = [
@@ -819,7 +1258,11 @@ def audit_manifest(
             hashlib.sha256(text.encode("utf-8")).hexdigest() for text in instructions
         ]
         report["dataset_order_digest"] = order_digest(
-            manifest.rows, instructions=instructions,
+            order_rows, instructions=instructions,
+        )
+        report["dataset_order_source"] = (
+            execution.order_source if execution is not None
+            else "pilot_manifest.json"
         )
         report["instructions_available"] = manifest.instructions_available
     return report

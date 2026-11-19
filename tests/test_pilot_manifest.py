@@ -19,8 +19,10 @@ from l3_integration.pilot_manifest import (
     EXPECTED_EPISODE_MANIFEST_SHA256,
     EXPECTED_EPISODES,
     EXPECTED_PILOT_MANIFEST_SHA256,
+    ExecutionManifest,
     PilotManifestError,
     audit_manifest,
+    build_execution_manifest,
     canonical_episode_manifest_sha256,
     canonicalize_episode_manifest,
     compare_episode_manifest_to_pilot,
@@ -31,7 +33,9 @@ from l3_integration.pilot_manifest import (
     scan_episode_manifests,
     scene_basename,
     select_pilot_episodes,
+    sha256_file,
     validate_pilot_manifest,
+    write_execution_manifest,
 )
 
 FIXED_CANONICAL_DIGEST = (
@@ -351,20 +355,418 @@ def test_episode_manifest_bad_canonical_digest_is_rejected(tmp_path) -> None:
         )
 
 
-def test_episode_manifest_order_must_match_the_pilot(tmp_path) -> None:
+def test_same_set_different_order_passes_and_uses_historical_order(
+    tmp_path,
+) -> None:
     pilot_path, pilot_digest = _write_manifest(tmp_path)
-    rows = _episode_rows()
-    rows[0], rows[1] = rows[1], rows[0]
-    episode_path, _file_digest, canonical = _write_episode_manifest(
-        tmp_path, rows=rows,
+    load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, episode_file, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
     )
-    with pytest.raises(PilotManifestError, match="order/identity differs"):
+    report = audit_manifest(
+        pilot_path,
+        expected_sha256=pilot_digest,
+        dataset_episodes=_dataset_episodes(),
+        episode_manifest=episode_path,
+        expected_episode_manifest_sha256=canonical,
+    )
+    episode = report["episode_manifest"]
+    comparison = episode["pilot_comparison"]
+    assert episode["verified"] is True
+    assert episode["canonical_sha256"] == canonical
+    assert episode["file_sha256"] == episode_file
+    assert comparison["match"] is True
+    assert comparison["sets_equal"] is True
+    assert comparison["order_matches"] is False
+    assert comparison["order_relation"] == "same_set_different_order"
+    assert comparison["order_source"] == "episode_manifest.json"
+    assert comparison["first_key"] == (
+        scene_basename(episode_rows[0]["scene_id"]),
+        episode_rows[0]["episode_id"],
+    )
+    assert report["dataset_order_source"] == "episode_manifest.json"
+    assert [row["episode_id"] for row in report["dataset_episode_keys"]] == [
+        row["episode_id"] for row in episode_rows
+    ]
+    execution = report["execution_manifest"]
+    assert execution["aligned"] is True
+    assert execution["canonical_sha256"] == canonical
+    assert execution["historical_episode_manifest_canonical_sha256"] == canonical
+    assert execution["count"] == 88
+    assert execution["order_source"] == "episode_manifest.json"
+    assert execution["order_matches_pilot"] is False
+    assert [row["episode_id"] for row in execution["episodes"]] == [
+        row["episode_id"] for row in episode_rows
+    ]
+
+
+def test_execution_order_is_the_historical_manifest_order(tmp_path) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    execution = build_execution_manifest(episode, pilot)
+    assert execution.keys() == tuple(
+        (scene_basename(row["scene_id"]), row["episode_id"])
+        for row in episode_rows
+    )
+    assert execution.keys() == tuple(reversed(pilot.keys()))
+    assert execution.canonical_sha256 == canonical
+    assert [row.execution_index for row in execution.rows] == list(range(88))
+
+
+def test_distance_group_is_associated_by_episode_key_not_position(
+    tmp_path,
+) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    execution = build_execution_manifest(episode, pilot)
+    pilot_by_key = {
+        (row.scene_basename, row.episode_id): row for row in pilot.rows
+    }
+    assert [row.distance_group for row in execution.rows] == [
+        pilot_by_key[row.key].distance_group for row in execution.rows
+    ]
+    first = execution.rows[0]
+    assert first.distance_group == pilot_by_key[first.key].distance_group
+    assert first.distance_group == "long"
+    assert first.distance_group != pilot.rows[0].distance_group
+    assert first.pilot_index == 87
+    assert first.execution_index == 0
+    assert execution.strata_counts() == pilot.strata_counts()
+
+
+def test_dataset_selection_uses_historical_order_and_keyed_instructions(
+    tmp_path,
+) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    execution = build_execution_manifest(episode, pilot)
+    # Give the dataset the Pilot's order, which is distinct from both the
+    # historical order and the reversed helper order. Selection must still
+    # follow the ExecutionManifest, not the dataset list.
+    dataset = list(reversed(_dataset_episodes()))
+    selected = select_pilot_episodes(
+        dataset, pilot, execution_manifest=execution,
+    )
+    assert [str(item.episode_id) for item in selected] == [
+        row["episode_id"] for row in episode_rows
+    ]
+    assert [str(item.episode_id) for item in dataset] == [
+        row.episode_id for row in pilot.rows
+    ]
+    assert [str(item.episode_id) for item in selected] != [
+        row.episode_id for row in pilot.rows
+    ]
+
+    # Instruction validation must follow the Episode key, not list position.
+    target = next(
+        item for item in dataset
+        if item.episode_id == episode_rows[0]["episode_id"]
+    )
+    target.instruction = "a different instruction"
+    with pytest.raises(PilotManifestError, match="instruction differs"):
+        select_pilot_episodes(
+            dataset, pilot, execution_manifest=execution,
+        )
+
+
+def test_missing_episode_fails_set_consistency(tmp_path) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=_episode_rows()[:-1],
+    )
+    with pytest.raises(PilotManifestError, match="has 87 Episodes"):
         audit_manifest(
             pilot_path,
             expected_sha256=pilot_digest,
             episode_manifest=episode_path,
             expected_episode_manifest_sha256=canonical,
         )
+
+
+def test_equal_count_missing_episode_fails_set_consistency(tmp_path) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    rows = _episode_rows()[:-1] + [{
+        "scene_id": "/autodl/scene_datasets/hm3d/SceneExtra.glb",
+        "episode_id": "episode-extra",
+    }]
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=rows,
+    )
+    with pytest.raises(
+        PilotManifestError, match="Episode set differs from the Pilot",
+    ) as error:
+        audit_manifest(
+            pilot_path,
+            expected_sha256=pilot_digest,
+            episode_manifest=episode_path,
+            expected_episode_manifest_sha256=canonical,
+        )
+    assert "episode-10-7" in str(error.value)
+    assert "episode-extra" in str(error.value)
+
+
+def test_extra_episode_fails_set_consistency(tmp_path) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    rows = _episode_rows()
+    rows[-1] = {
+        "scene_id": "/autodl/scene_datasets/hm3d/SceneExtra.glb",
+        "episode_id": "episode-extra",
+    }
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=rows,
+    )
+    with pytest.raises(
+        PilotManifestError, match="Episode set differs from the Pilot",
+    ) as error:
+        audit_manifest(
+            pilot_path,
+            expected_sha256=pilot_digest,
+            episode_manifest=episode_path,
+            expected_episode_manifest_sha256=canonical,
+        )
+    assert "missing=" in str(error.value)
+    assert "episode-extra" in str(error.value)
+    # 89 rows also fails the explicit 88-Episode count gate.
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path,
+        rows=_episode_rows() + [{
+            "scene_id": "/autodl/scene_datasets/hm3d/SceneExtra.glb",
+            "episode_id": "episode-extra",
+        }],
+    )
+    with pytest.raises(PilotManifestError, match="has 89 Episodes"):
+        audit_manifest(
+            pilot_path,
+            expected_sha256=pilot_digest,
+            episode_manifest=episode_path,
+            expected_episode_manifest_sha256=canonical,
+        )
+
+
+def test_duplicate_episode_fails_uniqueness_check(tmp_path) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    rows = _episode_rows()
+    rows[-1] = dict(rows[0])
+    data = {"split": "val_unseen", "expected_count": 88, "episodes": rows}
+    episode_path = tmp_path / "episode_manifest.json"
+    episode_path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(PilotManifestError, match="duplicate episode in manifest"):
+        load_episode_manifest(episode_path, expected_canonical_sha256=None)
+    with pytest.raises(PilotManifestError, match="duplicate episode in manifest"):
+        audit_manifest(
+            pilot_path,
+            expected_sha256=pilot_digest,
+            episode_manifest=episode_path,
+            expected_episode_manifest_sha256=None,
+        )
+
+
+def test_generated_execution_manifest_aligns_with_historical_digest(
+    tmp_path,
+) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    execution = build_execution_manifest(episode, pilot)
+    target = tmp_path / "output" / "execution_manifest.json"
+
+    report = write_execution_manifest(
+        target, execution, expected_canonical_sha256=canonical,
+    )
+    assert report["verified"] is True
+    assert report["aligned"] is True
+    assert report["created"] is True
+    assert report["canonical_sha256"] == canonical
+    assert report["historical_episode_manifest_canonical_sha256"] == canonical
+    assert report["file_sha256"] == sha256_file(target)
+    assert report["path"] == str(target)
+
+    written = json.loads(target.read_text(encoding="utf-8"))
+    assert canonical_episode_manifest_sha256(written) == canonical
+    assert written["execution_order"] == "episode_manifest.json"
+    assert len(written["episodes"]) == 88
+    assert [row["episode_id"] for row in written["episodes"]] == [
+        row["episode_id"] for row in episode_rows
+    ]
+    assert written["episodes"][0]["distance_group"] == "long"
+    assert "instruction" in written["episodes"][0]
+    loaded = load_episode_manifest(
+        target, expected_canonical_sha256=canonical,
+    )
+    assert loaded.keys() == execution.keys()
+
+    before = target.read_bytes()
+    again = write_execution_manifest(
+        target, execution, expected_canonical_sha256=canonical,
+    )
+    assert again["created"] is False
+    assert again["verified"] is True
+    assert again["canonical_sha256"] == canonical
+    assert target.read_bytes() == before
+
+    # Canonicalisation ignores Pilot metadata, so a tampered distance_group
+    # keeps the digest but must not be accepted as an already-valid artifact.
+    tampered = json.loads(target.read_text(encoding="utf-8"))
+    tampered["episodes"][0]["distance_group"] = "short"
+    target.write_text(json.dumps(tampered, indent=2), encoding="utf-8")
+    with pytest.raises(PilotManifestError, match="metadata differs"):
+        write_execution_manifest(
+            target, execution, expected_canonical_sha256=canonical,
+        )
+
+
+def test_manually_built_execution_manifest_with_wrong_set_is_rejected(
+    tmp_path,
+) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    execution = build_execution_manifest(episode, pilot)
+    broken = ExecutionManifest(
+        episode=episode,
+        pilot=pilot,
+        rows=execution.rows[:-1],
+        canonical_sha256=execution.canonical_sha256,
+    )
+    assert len(broken.rows) == 87
+    with pytest.raises(PilotManifestError, match="has 87 Episodes"):
+        broken.comparison()
+    with pytest.raises(PilotManifestError, match="has 87 Episodes"):
+        audit_manifest(
+            pilot_path,
+            expected_sha256=pilot_digest,
+            episode_manifest=episode_path,
+            expected_episode_manifest_sha256=canonical,
+            execution_manifest=broken,
+        )
+
+
+def test_execution_manifest_rejects_a_wrong_expected_digest(tmp_path) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    execution = build_execution_manifest(episode, pilot)
+    with pytest.raises(PilotManifestError, match="canonical SHA256 mismatch"):
+        write_execution_manifest(
+            tmp_path / "execution_manifest.json",
+            execution,
+            expected_canonical_sha256="0" * 64,
+        )
+
+
+def test_write_execution_manifest_refuses_to_overwrite_input_files(
+    tmp_path,
+) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, _file_digest, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    execution = build_execution_manifest(episode, pilot)
+    pilot_before = pilot_path.read_bytes()
+    episode_before = episode_path.read_bytes()
+
+    with pytest.raises(
+        PilotManifestError, match="refusing to overwrite the historical",
+    ):
+        write_execution_manifest(
+            episode_path, execution,
+            expected_canonical_sha256=canonical,
+        )
+    with pytest.raises(
+        PilotManifestError, match="refusing to overwrite the pilot_manifest",
+    ):
+        write_execution_manifest(
+            pilot_path, execution,
+            expected_canonical_sha256=canonical,
+        )
+    assert pilot_path.read_bytes() == pilot_before
+    assert episode_path.read_bytes() == episode_before
+
+
+def test_original_manifest_files_and_their_fixed_hashes_are_unchanged(
+    tmp_path,
+) -> None:
+    pilot_path, pilot_digest = _write_manifest(tmp_path)
+    episode_rows = list(reversed(_episode_rows()))
+    episode_path, episode_file, canonical = _write_episode_manifest(
+        tmp_path, rows=episode_rows,
+    )
+    pilot_bytes = pilot_path.read_bytes()
+    episode_bytes = episode_path.read_bytes()
+    assert sha256_file(pilot_path) == pilot_digest
+    assert sha256_file(episode_path) == episode_file
+    assert canonical != episode_file
+
+    # Each file is verified with its own fixed digest algorithm.
+    pilot = load_pilot_manifest(pilot_path, expected_sha256=pilot_digest)
+    episode = load_episode_manifest(
+        episode_path, expected_canonical_sha256=canonical,
+    )
+    with pytest.raises(PilotManifestError, match="pilot manifest file SHA256"):
+        load_pilot_manifest(pilot_path, expected_sha256=canonical)
+    with pytest.raises(PilotManifestError, match="canonical SHA256 mismatch"):
+        load_episode_manifest(
+            episode_path, expected_canonical_sha256=pilot_digest,
+        )
+
+    execution = build_execution_manifest(episode, pilot)
+    write_execution_manifest(
+        tmp_path / "generated" / "execution_manifest.json",
+        execution,
+        expected_canonical_sha256=canonical,
+    )
+    assert pilot_path.read_bytes() == pilot_bytes
+    assert episode_path.read_bytes() == episode_bytes
+    assert sha256_file(pilot_path) == pilot_digest
+    assert sha256_file(episode_path) == episode_file
+    assert canonical_episode_manifest_sha256(
+        json.loads(episode_path.read_text(encoding="utf-8"))
+    ) == canonical
 
 
 def test_parent_manifest_verification_is_separate(tmp_path) -> None:

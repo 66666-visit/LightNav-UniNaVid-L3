@@ -22,10 +22,13 @@ from l3_integration.pilot_manifest import (
     EXPECTED_EPISODE_MANIFEST_SHA256,
     EXPECTED_PILOT_MANIFEST_SHA256,
     audit_manifest,
+    build_execution_manifest,
     episode_instruction,
+    load_episode_manifest,
     load_pilot_manifest,
     scene_basename,
     select_pilot_episodes,
+    write_execution_manifest,
 )
 
 
@@ -105,7 +108,8 @@ def main():
         default="",
         help=(
             "optional evaluation episode_manifest.json; when supplied, its "
-            "canonical completion-marker digest and Episode order are verified"
+            "canonical completion-marker digest is verified, its 88-Episode "
+            "set is matched to the Pilot, and its order is the execution order"
         ),
     )
     parser.add_argument(
@@ -194,18 +198,25 @@ def _json_safe(value):
 
 def _write_run_metadata(path: str, metadata: dict) -> None:
     target = Path(path)
+    metadata = _json_safe(metadata)
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         existing = json.loads(target.read_text(encoding="utf-8"))
         if existing != metadata:
             raise RuntimeError(
-                f"result path already contains a different run_config.json: {target}"
+                f"result path already contains a different {target.name}: {target}"
             )
         return
-    target.write_text(
-        json.dumps(_json_safe(metadata), indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
@@ -260,12 +271,21 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             raise ValueError(
                 f"formal evaluation requires --expected-episodes {EXPECTED_EPISODES}"
             )
+        if (
+            episode_manifest
+            and episode_manifest_sha256 != EXPECTED_EPISODE_MANIFEST_SHA256
+        ):
+            raise ValueError(
+                "formal evaluation requires --episode-manifest-sha256 "
+                f"{EXPECTED_EPISODE_MANIFEST_SHA256} (historical canonical "
+                "digest); empty/different digests are not allowed"
+            )
     if not isinstance(allow_nonpilot_eval, bool):
         raise ValueError("allow_nonpilot_eval must be explicit boolean")
     if episode_manifest and not pilot_manifest:
         raise ValueError(
-            "--episode-manifest requires --pilot-manifest for the ordered "
-            "88-Episode identity comparison"
+            "--episode-manifest requires --pilot-manifest for the strict "
+            "88-Episode set comparison and execution-order reconciliation"
         )
     if parent_manifest and not pilot_manifest:
         raise ValueError(
@@ -286,8 +306,8 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
     if require_episode_manifest and not episode_manifest:
         raise ValueError(
             "--require-episode-manifest requires --episode-manifest; supply "
-            "the historical evaluation manifest so its canonical digest and "
-            "ordered 88 Episodes can be verified"
+            "the historical evaluation manifest so its canonical digest, "
+            "88-Episode set and execution order can be verified"
         )
 
     config = get_config(exp_config, opts)
@@ -298,6 +318,8 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
 
     manifest = None
     manifest_audit = None
+    execution_manifest = None
+    execution_report = None
     episode_order = {}
     if pilot_manifest:
         effective_pilot_sha = (
@@ -307,7 +329,18 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
         manifest = load_pilot_manifest(
             pilot_manifest, expected_sha256=effective_pilot_sha,
         )
-        selected = select_pilot_episodes(dataset.episodes, manifest)
+        if episode_manifest:
+            historical_episode = load_episode_manifest(
+                episode_manifest,
+                expected_canonical_sha256=episode_manifest_sha256 or None,
+            )
+            execution_manifest = build_execution_manifest(
+                historical_episode, manifest,
+            )
+        selected = select_pilot_episodes(
+            dataset.episodes, manifest,
+            execution_manifest=execution_manifest,
+        )
         if expected_episodes and len(selected) != expected_episodes:
             raise ValueError(
                 f"pilot manifest selected {len(selected)} Episodes; "
@@ -321,6 +354,15 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
         dataset_split = copy.copy(dataset)
         dataset_split.episodes = selected[split_id::split_num]
         instructions = [episode_instruction(episode) for episode in selected]
+        instruction_by_key = {
+            (scene_basename(episode.scene_id), str(episode.episode_id)):
+                episode_instruction(episode)
+            for episode in selected
+        }
+        pilot_instructions = [
+            instruction_by_key[(row.scene_basename, row.episode_id)]
+            for row in manifest.rows
+        ]
         manifest_audit = audit_manifest(
             pilot_manifest,
             expected_sha256=effective_pilot_sha,
@@ -329,10 +371,20 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             expected_episode_manifest_sha256=(
                 episode_manifest_sha256 or None
             ),
+            execution_manifest=execution_manifest,
             parent_manifest=parent_manifest or None,
         )
+        manifest_audit["pilot_order_digest_with_instructions"] = (
+            manifest.order_digest(instructions=pilot_instructions)
+        )
         manifest_audit["dataset_order_digest_with_instructions"] = (
-            manifest.order_digest(instructions=instructions)
+            execution_manifest.order_digest(instructions=instructions)
+            if execution_manifest is not None
+            else manifest.order_digest(instructions=instructions)
+        )
+        manifest_audit["execution_order"] = (
+            execution_manifest.order_source
+            if execution_manifest is not None else "pilot_manifest.json"
         )
         manifest_audit["shard"] = {
             "split_num": split_num, "split_id": split_id,
@@ -342,6 +394,38 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             episode_order[
                 (scene_basename(episode.scene_id), str(episode.episode_id))
             ] = index
+        if execution_manifest is not None:
+            execution_report = write_execution_manifest(
+                os.path.join(result_path, "execution_manifest.json"),
+                execution_manifest,
+                expected_canonical_sha256=episode_manifest_sha256,
+            )
+            manifest_audit["execution_manifest_verification"] = execution_report
+            _write_run_metadata(
+                os.path.join(result_path, "manifest_alignment.json"),
+                {
+                    "aligned": True,
+                    "execution_order": execution_manifest.order_source,
+                    "pilot_manifest": {
+                        "path": str(manifest.path),
+                        "file_sha256": manifest.file_sha256,
+                        "expected_file_sha256": effective_pilot_sha,
+                    },
+                    "episode_manifest": {
+                        "path": str(historical_episode.path),
+                        "file_sha256": historical_episode.file_sha256,
+                        "canonical_sha256": historical_episode.canonical_sha256,
+                        "expected_canonical_sha256": episode_manifest_sha256,
+                    },
+                    "pilot_comparison": manifest_audit["episode_manifest"][
+                        "pilot_comparison"
+                    ],
+                    "execution_manifest": {
+                        key: value for key, value in execution_report.items()
+                        if key != "created"
+                    },
+                },
+            )
     else:
         dataset_split = dataset.get_splits(split_num)[split_id]
         if expected_episodes and len(dataset_split.episodes) != expected_episodes:
@@ -367,6 +451,8 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
         },
         manifest_audit=manifest_audit,
         episode_order=episode_order,
+        execution_manifest=execution_manifest,
+        execution_report=execution_report,
         exp_config=exp_config,
         allow_nonpilot_eval=allow_nonpilot_eval,
     )
@@ -404,6 +490,8 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                    seed: int = 42, l3_options: dict | None = None,
                    manifest_audit: dict | None = None,
                    episode_order: dict | None = None,
+                   execution_manifest=None,
+                   execution_report: dict | None = None,
                    exp_config: str = "",
                    allow_nonpilot_eval: bool = False) -> None:
 
@@ -445,6 +533,9 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
         raise ValueError(f"unknown model name: {model_name}")
 
     os.makedirs(result_path, exist_ok=True)
+    execution_audit = (
+        execution_manifest.audit() if execution_manifest is not None else None
+    )
     run_metadata = {
         "group": experiment_group,
         "model_name": model_name,
@@ -481,6 +572,26 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
             manifest_audit is not None
             and manifest_audit.get("episode_manifest", {}).get("verified")
         ),
+        "episode_manifest_aligned": bool(
+            execution_manifest is not None
+            and execution_manifest.canonical_sha256
+            == execution_manifest.episode.canonical_sha256
+        ),
+        "execution_order": (
+            manifest_audit.get("execution_order") if manifest_audit else None
+        ),
+        "execution_manifest_canonical_sha256": (
+            execution_manifest.canonical_sha256
+            if execution_manifest is not None else None
+        ),
+        "execution_manifest": execution_audit,
+        "execution_manifest_verification": (
+            {
+                key: value for key, value in execution_report.items()
+                if key != "created"
+            }
+            if execution_report is not None else None
+        ),
         "manifests": {
             "pilot": {
                 "path": (
@@ -504,8 +615,13 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                 manifest_audit.get("episode_manifest")
                 if manifest_audit else None
             ),
+            "execution": execution_audit,
         },
         "pilot_order_digest": (
+            manifest_audit.get("pilot_order_digest_with_instructions")
+            if manifest_audit else None
+        ),
+        "execution_order_digest": (
             manifest_audit.get("dataset_order_digest_with_instructions")
             if manifest_audit else None
         ),
@@ -539,6 +655,9 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
     planned_episodes = list(env.episodes)
     if len(planned_episodes) != num_episodes:
         raise RuntimeError("env.episodes changed length before evaluation")
+    execution_rows = (
+        execution_manifest.index() if execution_manifest is not None else {}
+    )
     EARLY_STOP_ROTATION = config.EVAL.EARLY_STOP_ROTATION
     EARLY_STOP_STEPS = config.EVAL.EARLY_STOP_STEPS
 
@@ -639,11 +758,23 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                 manifest_audit is not None
                 and manifest_audit.get("episode_manifest", {}).get("verified")
             )
+            episode_key = (
+                scene_basename(env.current_episode.scene_id),
+                str(env.current_episode.episode_id),
+            )
+            execution_row = execution_rows.get(episode_key)
             result_dict["manifest_order_index"] = (
-                (episode_order or {}).get(
-                    (scene_basename(env.current_episode.scene_id),
-                     str(env.current_episode.episode_id))
-                )
+                execution_row.execution_index if execution_row is not None
+                else (episode_order or {}).get(episode_key)
+            )
+            result_dict["execution_order"] = (
+                (manifest_audit or {}).get("execution_order")
+            )
+            result_dict["distance_group"] = (
+                execution_row.distance_group if execution_row is not None else None
+            )
+            result_dict["pilot_manifest_index"] = (
+                execution_row.pilot_index if execution_row is not None else None
             )
             result_dict["scene_basename"] = scene_basename(
                 env.current_episode.scene_id
