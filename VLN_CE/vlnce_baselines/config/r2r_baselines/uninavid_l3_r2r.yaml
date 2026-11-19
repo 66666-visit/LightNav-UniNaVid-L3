@@ -1,0 +1,8 @@
+BASE_TASK_CONFIG_PATH: VLN_CE/habitat_extensions/config/vlnce_task_uninavid_l3_r2r.yaml
+EVAL:
+    IDENTIFICATION: r2r_l3
+    SPLIT: val_unseen
+    # Same early-stop protocol as the official uninavid_r2r.yaml.  Both groups
+    # use this config; only the L3 sidecar differs.
+    EARLY_STOP_ROTATION: 25
+    EARLY_STOP_STEPS: 400

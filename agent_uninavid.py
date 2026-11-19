@@ -1,25 +1,68 @@
 import numpy as np
 
 from habitat.core.agent import Agent
+import contextlib
+import json
 import os
 import re
+import time
 import torch
 import cv2
 import imageio
 from habitat.utils.visualizations import maps
 import random
 
+from l3_integration.official_prompt import (
+    build_prompt,
+    build_task_text,
+    prompt_sha256,
+    verify_task_text_injection,
+)
+
 from uninavid.mm_utils import get_model_name_from_path
 from uninavid.model.builder import load_pretrained_model
 from uninavid.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from uninavid.conversation import conv_templates, SeparatorStyle
 from uninavid.mm_utils import tokenizer_image_token, KeywordsStoppingCriteria
-  
+
+
+@contextlib.contextmanager
+def _preserve_rng_state():
+    """Keep the optional L3 perception path from perturbing model sampling.
+
+    Both experiment groups are paired per Episode.  The L3 sidecar runs YOLO
+    and serialization before ``model.generate``; neither may advance the RNG
+    that the official decoder consumes.
+    """
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = None
+    try:
+        if torch.cuda.is_available():
+            cuda_states = torch.cuda.get_rng_state_all()
+    except Exception:  # noqa: BLE001 - CUDA may be unavailable in CPU tests
+        cuda_states = None
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
 
 class UniNaVid_Agent(Agent):
-    def __init__(self, model_path, result_path, exp_save):
+    def __init__(self, model_path, result_path, exp_save, l3_sidecar=None,
+                 env=None, config=None, experiment_group="uninavid_baseline"):
         
         print("Initialize UniNaVid")
+
+        self.l3 = l3_sidecar
+        self.env = env
+        self.config = config
+        self.experiment_group = experiment_group
 
         self.result_path = result_path
         self.require_map = True if "video" in exp_save else False
@@ -28,9 +71,14 @@ class UniNaVid_Agent(Agent):
         
         self.conv_mode = "vicuna_v1"
         
-        if self.require_map or self.require_data:
-            os.makedirs(self.result_path, exist_ok=True)
-        
+        os.makedirs(self.result_path, exist_ok=True)
+        self.steps_path = os.path.join(self.result_path, "steps.jsonl")
+        # Per-step diagnostics are only materialised for data-saving runs.
+        self._steps_stream = (
+            open(self.steps_path, "a", encoding="utf-8")
+            if self.require_data else None
+        )
+
         if self.require_data:
             os.makedirs(os.path.join(self.result_path, "log"), exist_ok=True)
         
@@ -46,6 +94,7 @@ class UniNaVid_Agent(Agent):
 
         
         self.promt_template = "Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations and an image of the current observation <image>. Your assigned task is: '{}'. Analyze this series of images to determine your next four actions. The predicted action should be one of the following: forward, left, right, or stop."
+        self.prompt_template_sha256 = prompt_sha256(self.promt_template)
 
         # self.history_rgb_tensor = None
         
@@ -127,6 +176,7 @@ class UniNaVid_Agent(Agent):
         if token_prompt.numel() > 0:
             new_list.append(token_prompt)
         input_ids = torch.cat(new_list, dim=0).unsqueeze(0)
+        self.last_prompt_tokens = int(input_ids.shape[1])
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         keywords = [stop_str]
@@ -233,7 +283,7 @@ class UniNaVid_Agent(Agent):
         return new_image
 
 
-    def reset(self):
+    def reset(self, episode=None, instruction=""):
                 
         if self.require_map:
             if len(self.topdown_map_list)!=0:
@@ -254,7 +304,259 @@ class UniNaVid_Agent(Agent):
         self.model.get_model().initialize_online_inference_nav_feat_cache()
         self.model.get_model().new_frames = 0
         self.first_forward = False
-        
+
+        # --- L3 instrumentation/state (does not alter the official loop) ---
+        self.step_index = 0
+        self.step_diagnostics = []
+        self.inference_latencies_ms = []
+        self.prompt_token_counts = []
+        self.last_prompt_tokens = None
+        self.last_inference_ms = None
+        self.last_prompt_text = None
+        self.last_task_text = None
+        self.last_l3_context_text = None
+        self.episode_instruction = instruction
+        if getattr(self, "l3", None) is not None:
+            if episode is None:
+                # Construction calls reset() before an Episode exists.  Do not
+                # start a map; the first per-Episode reset supplies the Episode.
+                with _preserve_rng_state():
+                    self.l3.close_episode()
+            else:
+                if not self.episode_instruction:
+                    self.episode_instruction = _episode_instruction(episode)
+                with _preserve_rng_state():
+                    self.l3.reset_episode(episode, self.episode_instruction)
+
+
+    def _observe_l3(self, observations, step):
+        sidecar = getattr(self, "l3", None)
+        if sidecar is None:
+            return {"l3_enabled": False}
+        diagnostic = {"l3_enabled": True, "agent_state_error": None}
+        agent_state = None
+        env = getattr(self, "env", None)
+        if env is None:
+            diagnostic["agent_state_error"] = "navigation env not bound"
+        else:
+            try:
+                agent_state = env.sim.get_agent_state()
+            except Exception as exc:  # noqa: BLE001 - report, never invent a pose
+                diagnostic["agent_state_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            with _preserve_rng_state():
+                observation_diagnostic = sidecar.observe(
+                    observations, agent_state, step,
+                    transition_record=bool(step > 0),
+                )
+        except Exception as exc:  # noqa: BLE001 - optional sidecar fails closed
+            observation_diagnostic = {
+                "step": step, "frame_valid": False,
+                "frame_error": f"{type(exc).__name__}: {exc}",
+            }
+        if isinstance(observation_diagnostic, dict):
+            diagnostic.update(observation_diagnostic)
+        else:
+            diagnostic["frame_valid"] = False
+            diagnostic["frame_error"] = "invalid L3 observe diagnostic"
+        return diagnostic
+
+
+    def _count_tokens(self, text):
+        try:
+            return int(len(self.tokenizer.encode(text, add_special_tokens=False)))
+        except Exception:  # noqa: BLE001 - token accounting is diagnostic only
+            return None
+
+
+    def _augment_task_text(self, instruction, step, diagnostic):
+        """Return (task_text, l3_context_or_none, diagnostic).
+
+        L3 is inserted only inside the official template's ``{}`` task slot.
+        The complete official prompt is formatted *after* this composition;
+        this method never appends to the full prompt.
+        """
+        sidecar = getattr(self, "l3", None)
+        if sidecar is None:
+            self.last_l3_context_text = None
+            return instruction, None, diagnostic
+        if not isinstance(instruction, str):
+            # Keep the baseline path's formatting/verification behaviour; do
+            # not let a malformed instruction become an L3-only failure.
+            self.last_l3_context_text = None
+            return instruction, None, diagnostic
+        try:
+            with _preserve_rng_state():
+                organization, context_diagnostic = sidecar.build_context(
+                    instruction, step,
+                )
+        except Exception as exc:  # noqa: BLE001 - optional L3 fails closed
+            diagnostic["context_injected"] = False
+            diagnostic["prompt_has_l3"] = False
+            diagnostic["context_reason"] = f"{type(exc).__name__}: {exc}"
+            self.last_l3_context_text = None
+            return instruction, None, diagnostic
+        def _no_context(reason):
+            diagnostic["context_injected"] = False
+            diagnostic["prompt_has_l3"] = False
+            diagnostic["context_reason"] = reason
+            self.last_l3_context_text = None
+            return instruction, None, diagnostic
+
+        if isinstance(context_diagnostic, dict):
+            diagnostic.update(context_diagnostic)
+        else:
+            return _no_context("invalid L3 diagnostic")
+
+        try:
+            organization_context = getattr(organization, "context", None)
+            context_text = (
+                getattr(organization_context, "text", None)
+                if organization_context is not None else None
+            )
+        except Exception as exc:  # noqa: BLE001 - malformed optional object
+            return _no_context(f"{type(exc).__name__}: {exc}")
+        if organization_context is None:
+            return _no_context("no L3 context")
+        if not isinstance(context_text, str) or not context_text.strip():
+            # An optional memory channel fails closed: never inject a malformed
+            # or empty block, and never touch the official task text.
+            return _no_context("empty or invalid L3 context")
+        task_text = build_task_text(instruction, context_text)
+        diagnostic["context_injected"] = True
+        diagnostic["prompt_has_l3"] = True
+        diagnostic["context_tokens"] = self._count_tokens(context_text)
+        self.last_l3_context_text = context_text
+        return task_text, context_text, diagnostic
+
+
+    @staticmethod
+    def _json_default(value):
+        item = getattr(value, "item", None)
+        if callable(item):
+            return item()
+        return str(value)
+
+
+    def _finish_step(self, diagnostic, *, action, inference_ms, prompt_tokens,
+                     prompt_text):
+        row = dict(diagnostic)
+        row["step"] = self.step_index
+        row["action"] = action
+        row["inference_ms"] = inference_ms
+        row["prompt_tokens"] = prompt_tokens
+        row["prompt_sha256"] = (
+            prompt_sha256(prompt_text) if prompt_text is not None else None
+        )
+        row["official_prompt_sha256"] = self.prompt_template_sha256
+        if prompt_text is not None and os.environ.get("L3_LOG_PROMPTS") == "1":
+            # Opt-in audit trail: the exact text passed to predict_inference.
+            row["prompt_text"] = prompt_text
+            row["task_text"] = self.last_task_text
+            row["l3_context_text"] = self.last_l3_context_text
+        row.setdefault("l3_enabled", getattr(self, "l3", None) is not None)
+        row.setdefault("context_injected", False)
+        row.setdefault("prompt_has_l3", False)
+        row.setdefault("fact_count", 0)
+        row.setdefault("context_chars", 0)
+        row.setdefault("context_tokens", 0)
+        row.setdefault("frame_valid", False)
+        row.setdefault("frame_error", None)
+        self.step_diagnostics.append(row)
+        stream = getattr(self, "_steps_stream", None)
+        if stream is not None and not stream.closed:
+            stream.write(json.dumps(row, ensure_ascii=False,
+                                    default=self._json_default) + "\n")
+            stream.flush()
+        if inference_ms is not None:
+            self.inference_latencies_ms.append(float(inference_ms))
+        if prompt_tokens is not None:
+            self.prompt_token_counts.append(int(prompt_tokens))
+        self.step_index += 1
+
+
+    def episode_summary(self):
+        rows = list(getattr(self, "step_diagnostics", []))
+        l3_rows = [row for row in rows if row.get("l3_enabled")]
+        context_rows = [row for row in l3_rows if row.get("context_injected")]
+        seg_values = [
+            float(row["segmentation_ms"]) for row in l3_rows
+            if row.get("segmentation_ms") is not None
+        ]
+        observe_values = [
+            float(row["observe_ms"]) for row in l3_rows
+            if row.get("observe_ms") is not None
+        ]
+        retrieval_values = [
+            float(row["retrieval_ms"]) for row in l3_rows
+            if row.get("retrieval_ms") is not None
+        ]
+        total_values = [
+            float(row.get("observe_ms", 0.0) or 0.0)
+            + float(row.get("retrieval_ms", 0.0) or 0.0)
+            for row in l3_rows
+        ]
+        context_tokens = [
+            int(row["context_tokens"]) for row in context_rows
+            if row.get("context_tokens") is not None
+        ]
+        fact_counts = [int(row.get("fact_count", 0) or 0) for row in context_rows]
+        latencies = list(getattr(self, "inference_latencies_ms", []))
+        prompt_tokens = list(getattr(self, "prompt_token_counts", []))
+        sidecar = getattr(self, "l3", None)
+        map_summary = None
+        if sidecar is not None:
+            with _preserve_rng_state():
+                map_summary = sidecar.map_snapshot()
+        env = getattr(self, "env", None)
+        scene_id = None
+        if env is not None and getattr(env, "current_episode", None) is not None:
+            scene_id = getattr(env.current_episode, "scene_id", None)
+        return {
+            "episode_id": getattr(self, "episode_id", None),
+            "scene_id": scene_id,
+            "experiment_group": getattr(self, "experiment_group", None),
+            "l3_enabled": sidecar is not None,
+            "env_steps": len(rows),
+            "inference_calls": len(latencies),
+            "inference_latency_ms_mean": _mean(latencies),
+            "inference_latency_ms_p50": _percentile(latencies, 0.50),
+            "inference_latency_ms_p95": _percentile(latencies, 0.95),
+            "prompt_tokens_mean": _mean(prompt_tokens),
+            "prompt_tokens_max": max(prompt_tokens) if prompt_tokens else None,
+            "prompt_has_l3_steps": sum(bool(row.get("prompt_has_l3")) for row in rows),
+            "l3_map_steps": sum(bool(row.get("frame_valid")) for row in l3_rows),
+            "l3_frame_unavailable_steps": sum(
+                not bool(row.get("frame_valid")) for row in l3_rows
+            ),
+            "l3_context_steps": len(context_rows),
+            "l3_fact_count_total": sum(fact_counts),
+            "l3_fact_count_mean_per_injected_step": _mean(fact_counts),
+            "l3_context_chars_mean": _mean([
+                float(row.get("context_chars", 0.0) or 0.0) for row in context_rows
+            ]),
+            "l3_context_tokens_mean": _mean(context_tokens),
+            "l3_segmentation_ms_mean": _mean(seg_values),
+            "l3_observe_ms_mean": _mean(observe_values),
+            "l3_retrieval_ms_mean": _mean(retrieval_values),
+            "l3_build_ms_mean": _mean(total_values),
+            "l3_object_nodes_final": (
+                map_summary["objects"] if map_summary is not None else 0
+            ),
+            "l3_map_summary": map_summary,
+            "official_prompt_sha256": getattr(self, "prompt_template_sha256", None),
+        }
+
+
+    def close(self):
+        stream = getattr(self, "_steps_stream", None)
+        if stream is not None and not stream.closed:
+            stream.flush()
+            stream.close()
+        sidecar = getattr(self, "l3", None)
+        if sidecar is not None:
+            with _preserve_rng_state():
+                sidecar.close_episode()
 
 
     def act(self, observations, info, episode_id):
@@ -262,6 +564,9 @@ class UniNaVid_Agent(Agent):
         self.episode_id = episode_id
         rgb = observations["rgb"]
         self.rgb_list.append(rgb)
+        instruction = observations["instruction"]["text"]
+        step = self.step_index
+        l3_diagnostic = self._observe_l3(observations, step)
 
         if self.require_map:
             top_down_map = maps.colorize_draw_agent_and_fit_to_height(info["top_down_map_vlnce"], rgb.shape[0])
@@ -271,20 +576,34 @@ class UniNaVid_Agent(Agent):
             temp_action = self.pending_action_list.pop(0)
             
             if self.require_map:
-                img = self.addtext(output_im, observations["instruction"]["text"], "Pending action: {}".format(temp_action))
+                img = self.addtext(output_im, instruction, "Pending action: {}".format(temp_action))
                 self.topdown_map_list.append(img)
             
-            
+            self._finish_step(
+                l3_diagnostic, action=temp_action, inference_ms=None,
+                prompt_tokens=None, prompt_text=None,
+            )
             return {"action": temp_action}
 
 
-        navigation_qs = self.promt_template.format(observations["instruction"]["text"])
-        
-  
+        task_text, l3_context, l3_diagnostic = self._augment_task_text(
+            instruction, step, l3_diagnostic,
+        )
+        navigation_qs = build_prompt(self.promt_template, task_text)
+        verify_task_text_injection(
+            self.promt_template, instruction, l3_context, navigation_qs,
+        )
+        self.last_task_text = task_text
+        self.last_prompt_text = navigation_qs
+        self.last_prompt_tokens = None
+
+        started = time.perf_counter()
         navigation = self.predict_inference(navigation_qs)
+        inference_ms = (time.perf_counter() - started) * 1000.0
+        self.last_inference_ms = inference_ms
         
         if self.require_map:
-            img = self.addtext(output_im, observations["instruction"]["text"], navigation)
+            img = self.addtext(output_im, instruction, navigation)
             self.topdown_map_list.append(img)
 
 
@@ -306,8 +625,41 @@ class UniNaVid_Agent(Agent):
                 break
 
         
+        selected_action = self.pending_action_list.pop(0)
+        self._finish_step(
+            l3_diagnostic, action=selected_action, inference_ms=inference_ms,
+            prompt_tokens=getattr(self, "last_prompt_tokens", None),
+            prompt_text=navigation_qs,
+        )
+        return {"action": selected_action}
 
-        
-        return {"action": self.pending_action_list.pop(0)}
 
-        
+def _episode_instruction(episode):
+    instruction = getattr(episode, "instruction", None)
+    if instruction is None:
+        return ""
+    if isinstance(instruction, str):
+        return instruction
+    return str(
+        getattr(instruction, "instruction_text", None)
+        or getattr(instruction, "text", None)
+        or ""
+    )
+
+
+def _mean(values):
+    finite = [float(value) for value in values if value is not None]
+    return sum(finite) / len(finite) if finite else None
+
+
+def _percentile(values, q):
+    finite = sorted(float(value) for value in values if value is not None)
+    if not finite:
+        return None
+    if len(finite) == 1:
+        return finite[0]
+    position = q * (len(finite) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(finite) - 1)
+    weight = position - lower
+    return finite[lower] * (1.0 - weight) + finite[upper] * weight

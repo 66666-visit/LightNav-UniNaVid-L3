@@ -1,4 +1,7 @@
 #!/bin/bash
+# LEGACY full-split evaluation helper (not the formal 88-Episode L3 A/B run).
+# --allow-nonpilot-eval is explicit: this path skips the frozen pilot manifest.
+# Use scripts/run_l3_ablation.sh for the formal experiment.
 
 CHUNKS=8
 
@@ -45,7 +48,8 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
     --model-path $MODEL_PATH \
     --result-path $SAVE_PATH \
     --model-name $MODEL_NAME \
-    --exp-save $EXP_SAVE &
+    --exp-save $EXP_SAVE \
+    --allow-nonpilot-eval &
     
 done
 
