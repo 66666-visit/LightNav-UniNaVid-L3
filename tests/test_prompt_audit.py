@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import builtins
 import hashlib
+import importlib.util
 import json
+import sys
 
 import pytest
 
@@ -24,6 +27,52 @@ from scripts import audit_prompt
 @pytest.fixture(scope="module")
 def audit():
     return audit_prompt.build_audit()
+
+
+def test_cv2_shim_is_installed_after_transformers_import(monkeypatch) -> None:
+    """Transformers probes ``find_spec("cv2")`` while importing.
+
+    The audit used to install a bare ``types.ModuleType("cv2")`` before
+    importing ``uninavid.mm_utils``.  That shim has ``__spec__ is None``, so
+    Transformers 4.46.3 raised ``ValueError: cv2.__spec__ is None``.  This
+    test triggers the same probe at the exact import boundary rather than
+    relying on the installed Transformers version.
+    """
+    real_import_module = audit_prompt.importlib.import_module
+    real_import = builtins.__import__
+    observed: dict[str, object] = {}
+    shim_names = ("cv2", "imageio")
+    before_shims = {name: sys.modules.get(name) for name in shim_names}
+
+    def probing_import_module(name, package=None):
+        if name == "uninavid.mm_utils":
+            observed["cv2_at_mm_utils"] = sys.modules.get("cv2")
+            # Exactly what Transformers 4.46.3 does during its own import.
+            importlib.util.find_spec("cv2")
+        return real_import_module(name, package=package)
+
+    def recording_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "agent_uninavid" and level == 0:
+            observed["cv2_at_agent"] = sys.modules.get("cv2")
+            observed["imageio_at_agent"] = sys.modules.get("imageio")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(
+        audit_prompt.importlib, "import_module", probing_import_module,
+    )
+    monkeypatch.setattr(builtins, "__import__", recording_import)
+
+    with audit_prompt._official_imports() as agent_module:
+        assert agent_module.__name__ == "agent_uninavid"
+        assert sys.modules["cv2"].__spec__ is None
+        assert sys.modules["imageio"].__spec__ is None
+
+    assert {name: sys.modules.get(name) for name in shim_names} == before_shims
+
+    cv2_at_mm_utils = observed["cv2_at_mm_utils"]
+    assert cv2_at_mm_utils is None or cv2_at_mm_utils.__spec__ is not None
+    assert observed["cv2_at_agent"].__spec__ is None
+    assert observed["imageio_at_agent"].__spec__ is None
 
 
 def test_baseline_prompt_is_the_byte_identical_official_prompt(audit) -> None:

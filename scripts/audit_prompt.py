@@ -57,7 +57,6 @@ from l3_integration.official_prompt import (  # noqa: E402
     REFERENCE_OFFICIAL_PROMPT_SHA256,
     REFERENCE_OFFICIAL_PROMPT_TEMPLATE,
     build_prompt,
-    build_task_text,
     prompt_sha256,
     split_official_template,
     update_prompt_view,
@@ -179,6 +178,12 @@ def _official_imports() -> Iterator[Any]:
     ``uninavid.conversation`` and ``uninavid.mm_utils`` modules are kept real.
     A package shim prevents ``uninavid/__init__.py`` from importing the heavy
     model architecture.
+
+    The ``cv2``/``imageio`` stand-ins are installed only *after*
+    ``uninavid.mm_utils`` has imported Transformers.  Transformers (4.46.3)
+    probes ``importlib.util.find_spec("cv2")`` during import, and a bare
+    ``types.ModuleType`` has ``__spec__ is None``, which makes ``find_spec``
+    raise ``ValueError``.
     """
     names = [
         "habitat", "habitat.core", "habitat.core.agent", "habitat.utils",
@@ -189,8 +194,6 @@ def _official_imports() -> Iterator[Any]:
     ]
     previous = {name: sys.modules.get(name) for name in names}
     try:
-        for name in ("cv2", "imageio"):
-            sys.modules[name] = types.ModuleType(name)
         habitat = types.ModuleType("habitat")
         habitat.__path__ = []
         sys.modules["habitat"] = habitat
@@ -213,9 +216,15 @@ def _official_imports() -> Iterator[Any]:
         package = types.ModuleType("uninavid")
         package.__path__ = [str(REPO_ROOT / "uninavid")]
         sys.modules["uninavid"] = package
-        # Real official text-processing modules.
+        # Real official text-processing modules.  These import Transformers,
+        # which probes find_spec("cv2") at import time, so the cv2/imageio
+        # stand-ins must not be in sys.modules yet.
         importlib.import_module("uninavid.conversation")
         importlib.import_module("uninavid.mm_utils")
+        # Only after Transformers is imported, install the cv2/imageio
+        # stand-ins needed by agent_uninavid.
+        for name in ("cv2", "imageio"):
+            sys.modules[name] = types.ModuleType(name)
         # Only the checkpoint loader is replaced; it is never called here.
         builder = types.ModuleType("uninavid.model.builder")
         builder.__path__ = []
