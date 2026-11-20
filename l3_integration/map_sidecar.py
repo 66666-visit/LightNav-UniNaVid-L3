@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from l3_memory.conceptgraphs_lite import ObjectMap
 from l3_memory.l3_official_prompt import L3OfficialPromptOrganizer
@@ -32,7 +32,9 @@ from l3_integration.habitat_geometry import (
 
 logger = logging.getLogger(__name__)
 
-FrameBuilder = Callable[[Mapping[str, Any], Any, CameraSpec], tuple[Any, dict[str, Any]]]
+FrameBuilder = Callable[
+    [Mapping[str, Any], Any, CameraSpec], Tuple[Any, Dict[str, Any]]
+]
 
 
 
@@ -47,9 +49,9 @@ class L3MapSidecar:
         max_items: int = 2,
         max_chars: int = 600,
         scope: str = "episode_local",
-        extractor: Any | None = None,
-        frame_builder: FrameBuilder | None = None,
-        organizer: L3OfficialPromptOrganizer | None = None,
+        extractor: Optional[Any] = None,
+        frame_builder: Optional[FrameBuilder] = None,
+        organizer: Optional[L3OfficialPromptOrganizer] = None,
     ) -> None:
         if not isinstance(config, SpatialL3Config):
             raise ValueError("config must be a SpatialL3Config")
@@ -87,16 +89,16 @@ class L3MapSidecar:
             if config.seg_model_path else "yolo11n-seg"
         )
         self.active = False
-        self.store: V3MemoryStore | None = None
-        self.object_map: ObjectMap | None = None
-        self.scene_id: str | None = None
-        self.episode_id: str | None = None
+        self.store: Optional[V3MemoryStore] = None
+        self.object_map: Optional[ObjectMap] = None
+        self.scene_id: Optional[str] = None
+        self.episode_id: Optional[str] = None
         self.instruction = ""
         self.last_frame = None
-        self.last_frame_step: int | None = None
-        self.last_observation_diagnostic: dict[str, Any] = {}
-        self.last_context_diagnostic: dict[str, Any] = {}
-        self.last_context_text: str | None = None
+        self.last_frame_step: Optional[int] = None
+        self.last_observation_diagnostic: Dict[str, Any] = {}
+        self.last_context_diagnostic: Dict[str, Any] = {}
+        self.last_context_text: Optional[str] = None
         self._step_observations = 0
         self._segmentation_attempts = 0
 
@@ -121,7 +123,9 @@ class L3MapSidecar:
             or ""
         )
 
-    def reset_episode(self, episode: Any, instruction: str = "") -> dict[str, Any]:
+    def reset_episode(
+        self, episode: Any, instruction: str = "",
+    ) -> Dict[str, Any]:
         """Start a new Episode with brand-new map and store objects."""
         if episode is None:
             raise ValueError("episode is required to reset the L3 map")
@@ -178,7 +182,7 @@ class L3MapSidecar:
         step: int,
         *,
         transition_record: bool = False,
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """Update the L3 map from the current RGB-D observation.
 
         Failures are recorded in the returned diagnostic and never raised into
@@ -188,7 +192,7 @@ class L3MapSidecar:
         """
         if not isinstance(step, int) or step < 0:
             raise ValueError("step must be a nonnegative integer")
-        diagnostic: dict[str, Any] = {
+        diagnostic: Dict[str, Any] = {
             "step": step,
             "l3_active": self.active,
             "frame_valid": False,
@@ -277,9 +281,9 @@ class L3MapSidecar:
 
     def build_context(
         self, instruction: str, step: int,
-    ) -> tuple[Any | None, dict[str, Any]]:
+    ) -> Tuple[Optional[Any], Dict[str, Any]]:
         """Retrieve and serialize L3 facts; return ``(organization, diagnostic)``."""
-        diagnostic: dict[str, Any] = {
+        diagnostic: Dict[str, Any] = {
             "step": step,
             "context_available": False,
             "context_injected": False,
@@ -352,11 +356,11 @@ class L3MapSidecar:
 
     # -- audit ----------------------------------------------------------------
 
-    def map_snapshot(self) -> dict[str, Any]:
+    def map_snapshot(self) -> Dict[str, Any]:
         """Small, JSON-safe map summary for per-Episode diagnostics."""
         if self.object_map is None:
             return {"objects": 0, "viewpoints": 0, "evidence": 0, "edges": 0}
-        labels: dict[str, int] = {}
+        labels: Dict[str, int] = {}
         for obj in self.object_map.objects.values():
             labels[obj.class_name] = labels.get(obj.class_name, 0) + 1
         return {
@@ -367,7 +371,7 @@ class L3MapSidecar:
             "labels": dict(sorted(labels.items())),
         }
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self) -> Dict[str, Any]:
         return {
             "scene_id": self.scene_id,
             "episode_id": self.episode_id,

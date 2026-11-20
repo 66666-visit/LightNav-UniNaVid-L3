@@ -15,16 +15,13 @@ normalized to its file basename because the Pilot, the historical
 scene with different prefixes.
 """
 
-from __future__ import annotations
-
-from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from .pilot_manifest import PilotManifestError, scene_basename
 
 #: Stable Episode identity: ``(scene file basename, episode_id)``.
-EpisodeKey = tuple[str, str]
+EpisodeKey = Tuple[str, str]
 
 
 class EpisodeExecutionError(RuntimeError):
@@ -60,12 +57,12 @@ def episode_identity(episode: Any) -> EpisodeKey:
 class EpisodeMetadata:
     """Frozen-manifest metadata attached to one Episode identity."""
 
-    manifest_order_index: int | None
-    pilot_manifest_index: int | None
-    distance_group: str | None
-    instruction: str | None = None
-    manifest_scene_id: str | None = None
-    manifest_episode_id: str | None = None
+    manifest_order_index: Optional[int]
+    pilot_manifest_index: Optional[int]
+    distance_group: Optional[str]
+    instruction: Optional[str] = None
+    manifest_scene_id: Optional[str] = None
+    manifest_episode_id: Optional[str] = None
 
 
 def _row_key(row: Any) -> EpisodeKey:
@@ -80,7 +77,7 @@ def _row_key(row: Any) -> EpisodeKey:
 
 def metadata_from_execution_manifest(
     execution_manifest: Any,
-) -> dict[EpisodeKey, EpisodeMetadata]:
+) -> Dict[EpisodeKey, EpisodeMetadata]:
     """Index the execution manifest by Episode identity, never by position.
 
     ``manifest_order_index`` is the row's position in the historical
@@ -88,7 +85,7 @@ def metadata_from_execution_manifest(
     the row's position in ``pilot_manifest.json``.  Both are diagnostics; the
     key is what associates them with a Habitat Episode.
     """
-    metadata: dict[EpisodeKey, EpisodeMetadata] = {}
+    metadata: Dict[EpisodeKey, EpisodeMetadata] = {}
     for row in execution_manifest.rows:
         key = _row_key(row)
         if key in metadata:
@@ -108,9 +105,9 @@ def metadata_from_execution_manifest(
 
 def metadata_from_pilot_manifest(
     pilot_manifest: Any,
-) -> dict[EpisodeKey, EpisodeMetadata]:
+) -> Dict[EpisodeKey, EpisodeMetadata]:
     """Index Pilot rows by identity for a Pilot-order (non-historical) run."""
-    metadata: dict[EpisodeKey, EpisodeMetadata] = {}
+    metadata: Dict[EpisodeKey, EpisodeMetadata] = {}
     for index, row in enumerate(pilot_manifest.rows):
         key = _row_key(row)
         if key in metadata:
@@ -146,17 +143,17 @@ class EpisodeExecutionTracker:
     def __init__(
         self,
         expected_episodes: Iterable[Any],
-        metadata_by_key: Mapping[EpisodeKey, EpisodeMetadata] | None = None,
+        metadata_by_key: Optional[Mapping[EpisodeKey, EpisodeMetadata]] = None,
         *,
         require_full_metadata: bool = False,
         context: str = "the expected execution set",
     ) -> None:
-        expected_keys: list[EpisodeKey] = []
+        expected_keys: List[EpisodeKey] = []
         for episode in expected_episodes:
             expected_keys.append(episode_identity(episode))
 
-        seen_expected: set[EpisodeKey] = set()
-        duplicates: list[EpisodeKey] = []
+        seen_expected: Set[EpisodeKey] = set()
+        duplicates: List[EpisodeKey] = []
         for key in expected_keys:
             if key in seen_expected and key not in duplicates:
                 duplicates.append(key)
@@ -194,11 +191,11 @@ class EpisodeExecutionTracker:
                         f"{_format_keys(extra)}"
                     )
 
-        self._seen: list[EpisodeKey] = []
-        self._seen_set: set[EpisodeKey] = set()
-        self._first_index: dict[EpisodeKey, int] = {}
-        self._records: list[
-            tuple[int, EpisodeKey, EpisodeMetadata | None]
+        self._seen: List[EpisodeKey] = []
+        self._seen_set: Set[EpisodeKey] = set()
+        self._first_index: Dict[EpisodeKey, int] = {}
+        self._records: List[
+            Tuple[int, EpisodeKey, Optional[EpisodeMetadata]]
         ] = []
 
     @property
@@ -210,10 +207,10 @@ class EpisodeExecutionTracker:
         return len(self._seen)
 
     @property
-    def expected_keys(self) -> tuple[EpisodeKey, ...]:
+    def expected_keys(self) -> Tuple[EpisodeKey, ...]:
         return self._expected_keys
 
-    def missing_keys(self) -> tuple[EpisodeKey, ...]:
+    def missing_keys(self) -> Tuple[EpisodeKey, ...]:
         return tuple(
             key for key in self._expected_keys if key not in self._seen_set
         )
@@ -224,7 +221,9 @@ class EpisodeExecutionTracker:
             return ""
         return f"; still missing {_format_keys(missing)}"
 
-    def accept(self, episode: Any) -> tuple[EpisodeKey, EpisodeMetadata | None]:
+    def accept(
+        self, episode: Any,
+    ) -> Tuple[EpisodeKey, Optional[EpisodeMetadata]]:
         """Validate one actual Episode and return its key and metadata."""
         key = episode_identity(episode)
         if key not in self._expected_set:
@@ -268,7 +267,7 @@ class EpisodeExecutionTracker:
                 f"{_format_keys(missing)}"
             )
 
-    def coverage(self) -> dict[str, Any]:
+    def coverage(self) -> Dict[str, Any]:
         """JSON-safe execution summary; diagnostics only, never an association."""
         return {
             "context": self.context,

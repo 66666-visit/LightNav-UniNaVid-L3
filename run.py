@@ -9,6 +9,7 @@ import os
 import random
 import time
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 from habitat.datasets import make_dataset
 from VLN_CE.vlnce_baselines.config.default import get_config
@@ -522,12 +523,13 @@ def _build_l3_sidecar(config, l3_options):
 def evaluate_agent(config, split_id, dataset, model_path, result_path, model_name,
                    exp_save, *, split_num: int = 1,
                    experiment_group: str = "uninavid_baseline",
-                   seed: int = 42, l3_options: dict | None = None,
-                   manifest_audit: dict | None = None,
-                   episode_order: dict | None = None,
-                   episode_metadata: dict | None = None,
+                   seed: int = 42,
+                   l3_options: Optional[Dict[str, Any]] = None,
+                   manifest_audit: Optional[Dict[str, Any]] = None,
+                   episode_order: Optional[Dict[Any, Any]] = None,
+                   episode_metadata: Optional[Dict[Any, Any]] = None,
                    execution_manifest=None,
-                   execution_report: dict | None = None,
+                   execution_report: Optional[Dict[str, Any]] = None,
                    exp_config: str = "",
                    allow_nonpilot_eval: bool = False) -> None:
 

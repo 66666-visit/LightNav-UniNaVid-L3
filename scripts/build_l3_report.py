@@ -5,8 +5,6 @@ No metric is invented: every number is read from the per-Episode rows written
 by run.py.  Pairing is mandatory; different or incomplete Episode sets fail.
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import hashlib
@@ -14,7 +12,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -44,10 +42,10 @@ RESOURCE_METRICS = (
 )
 
 
-def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
+def _read_jsonl(path: Path) -> Tuple[List[Dict[str, Any]], int]:
     if not path.is_file():
         raise FileNotFoundError(f"results.jsonl not found: {path}")
-    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    rows: Dict[Tuple[str, str], Dict[str, Any]] = {}
     duplicates = 0
     with path.open(encoding="utf-8") as stream:
         for number, line in enumerate(stream, 1):
@@ -68,14 +66,14 @@ def _read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
     return list(rows.values()), duplicates
 
 
-def _row_value(row: dict[str, Any], key: str) -> float | None:
+def _row_value(row: Dict[str, Any], key: str) -> Optional[float]:
     if key in {"success", "oracle_success"}:
         return 1.0 if bool(row.get(key)) else 0.0 if key in row else None
     return finite_float(row.get(key))
 
 
-def _group_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    values: dict[str, Any] = {"n_episodes": len(rows)}
+def _group_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    values: Dict[str, Any] = {"n_episodes": len(rows)}
     for name, key, scale, _direction in METRICS:
         values[name] = mean_or_none(
             value * scale for row in rows
@@ -113,8 +111,8 @@ def _group_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _delta_row(name: str, key: str, scale: float, direction: str,
-               baseline_rows: list[dict[str, Any]],
-               l3_rows: list[dict[str, Any]]) -> dict[str, Any]:
+               baseline_rows: List[Dict[str, Any]],
+               l3_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     a = [
         value * scale for row in baseline_rows
         if (value := _row_value(row, key)) is not None
@@ -149,7 +147,7 @@ def _write_results_merged(path: Path, baseline_rows, l3_rows) -> None:
                 stream.write(json.dumps(merged, ensure_ascii=False) + "\n")
 
 
-def _write_comparison(path: Path, comparison: list[dict[str, Any]]) -> None:
+def _write_comparison(path: Path, comparison: List[Dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(comparison[0]))
         writer.writeheader()
@@ -214,10 +212,11 @@ def _format(value: Any, digits: int = 3) -> str:
 
 
 def _write_report(
-    path: Path, *, baseline_metrics: dict[str, Any], l3_metrics: dict[str, Any],
-    comparison: list[dict[str, Any]], paired: dict[str, Any],
-    baseline_count: int, l3_count: int, manifest_sha: str | None,
-    source_sha: dict[str, str | None], duplicates: tuple[int, int],
+    path: Path, *, baseline_metrics: Dict[str, Any],
+    l3_metrics: Dict[str, Any],
+    comparison: List[Dict[str, Any]], paired: Dict[str, Any],
+    baseline_count: int, l3_count: int, manifest_sha: Optional[str],
+    source_sha: Dict[str, Optional[str]], duplicates: Tuple[int, int],
 ) -> None:
     lines = [
         "# Uni-NaVid L3-only paired experiment report",
@@ -293,7 +292,7 @@ def _write_report(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--l3", required=True)

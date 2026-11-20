@@ -84,7 +84,7 @@ def _episode_rows(rows=None) -> list[dict]:
         {
             "scene_id": (
                 "/autodl/scene_datasets/hm3d/"
-                f"Scene{scene_basename(row['scene_id']).removeprefix('Scene').removesuffix('.glb')}.glb"
+                f"Scene{scene_basename(row['scene_id'])[5:-4]}.glb"
             ),
             "episode_id": row["habitat_episode_id"],
         }
