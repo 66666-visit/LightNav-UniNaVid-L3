@@ -273,10 +273,14 @@ Both groups use:
 - the same checkpoint, `temperature=0.2`, `max_new_tokens=1024`, action parser,
   `pending_action_list`, early-stop values, vision history and Habitat config.
 
-Per-Episode deterministic seeding derives a seed from `(42, scene, episode)`,
-applies it **before** `env.reset()` and before the model call, and records
-`episode_seed` in each result row. L3 map/YOLO/serializer calls run inside an
-RNG save/restore wrapper, so the optional memory path cannot advance the
+Per-Episode deterministic seeding derives a seed from the **actual** Episode
+identity returned by `env.reset()` (`scene_id`, `episode_id`), applies it
+immediately after the identity check and before `agent.reset()` / the model
+call, and records `episode_seed` in each result row. The seed is never taken
+from a running list position. Habitat may cycle through the same 88 tasks in a
+different order in each group; A/B still use the same seed for the same
+`(scene_id, episode_id)`. L3 map/YOLO/serializer calls run inside an RNG
+save/restore wrapper, so the optional memory path cannot advance the
 torch/numpy/random state used by the official decoder. This does not change the
 official sampling parameters; it removes cross-Episode and L3-compute RNG drift
 from the paired comparison. It is an experiment-level control, not a model
@@ -302,9 +306,15 @@ is the only opt-out and is used by the legacy full-split helper
 - compares the two manifests as **strict sets** of
   `(scene_basename, episode_id)`; a different order is accepted, while a
   missing, extra, duplicate, wrong-count or wrong-scene Episode fails closed;
-- uses the historical `episode_manifest.json` order as the execution order and
+- uses the historical `episode_manifest.json` order as the **manifest order**
+  (planning and digest order), not as a required Habitat reset order, and
   indexes Pilot metadata (`distance_group`, `instruction`, …) by Episode key,
   never by list position;
+- validates actual execution by Episode identity after every `env.reset()`:
+  the Episode must be in the assigned set, may not be repeated, may not come
+  from outside the frozen 88, and every assigned Episode must be covered by the
+  end of the run; `manifest_order_index` and `pilot_manifest_index` are looked
+  up from that identity, while `habitat_execution_index` is diagnostic only;
 - matches dataset Episodes by unique scene basename + Episode ID (manifest and
   Habitat run may use different path prefixes);
 - writes `execution_manifest.json` in the historical order and verifies that
@@ -554,11 +564,13 @@ Expected artifacts: `summary.json`, `results.jsonl`, `comparison.csv`,
    default; `steps.jsonl` itself is only created for `data`-saving runs. The L3
    block is bounded by `max_chars=600` and `max_items=2`, but a model-side
    context guard was not added to the official inference path.
-5. **Stochastic decoding**: per-Episode seeding (before `env.reset`) and RNG
-   isolation make A/B paired starts equal, but a single 88-Episode run is not a
-   deterministic estimate; report CIs and paired tests, and do not over-claim
-   from SR alone. The per-Episode seed protocol is an experiment-level deviation
-   from upstream's one-shot `np.random.seed(42)` and must be reported.
+5. **Stochastic decoding**: per-Episode seeding keyed by the actual returned
+   Episode identity, plus RNG isolation, makes A/B paired starts equal even if
+   Habitat's reset order differs; but a single 88-Episode run is not a
+   deterministic estimate. Report CIs and paired tests, and do not over-claim
+   from SR alone. The per-Episode seed protocol is an experiment-level
+   deviation from upstream's one-shot `np.random.seed(42)` and must be
+   reported.
 6. **Small pilot**: 88 Episodes / 11 scenes has limited power. A non-significant
    result does not prove equivalence; a significant result needs replication.
 7. **L3 map quality is not ground truth**: the map is built from predicted

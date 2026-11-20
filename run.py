@@ -17,6 +17,12 @@ from habitat import Env
 from tqdm import trange
 import numpy as np
 
+from l3_integration.episode_execution import (
+    EpisodeExecutionError,
+    EpisodeExecutionTracker,
+    metadata_from_execution_manifest,
+    metadata_from_pilot_manifest,
+)
 from l3_integration.pilot_manifest import (
     EXPECTED_EPISODES,
     EXPECTED_EPISODE_MANIFEST_SHA256,
@@ -170,6 +176,23 @@ def _stable_episode_seed(seed: int, scene_id: str, episode_id: str) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2 ** 31 - 1)
 
 
+def _seed_episode_rngs(episode_seed: int) -> None:
+    """Apply one actual Episode's deterministic seed to the model RNGs.
+
+    The actual Episode identity is only known after ``env.reset()``; this is
+    called immediately after the identity check and before ``agent.reset()``
+    and the first model call.  A/B therefore share the same seed for the same
+    Episode even when Habitat visits Episodes in a different order.
+    """
+    random.seed(episode_seed)
+    np.random.seed(episode_seed)
+    try:
+        import torch
+    except ImportError:
+        return
+    torch.manual_seed(episode_seed)
+
+
 def _json_value(value):
     if isinstance(value, (np.floating,)):
         return float(value)
@@ -321,6 +344,7 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
     execution_manifest = None
     execution_report = None
     episode_order = {}
+    episode_metadata = None
     if pilot_manifest:
         effective_pilot_sha = (
             None if allow_nonpilot_eval and not pilot_sha256
@@ -351,6 +375,14 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
                 f"pilot manifest selected {len(selected)} Episodes; "
                 f"expected {EXPECTED_EPISODES}"
             )
+        # Metadata is indexed once by Episode identity.  Neither the dataset
+        # list position nor Habitat's reset order is used for association.
+        if execution_manifest is not None:
+            episode_metadata = metadata_from_execution_manifest(
+                execution_manifest,
+            )
+        else:
+            episode_metadata = metadata_from_pilot_manifest(manifest)
         dataset_split = copy.copy(dataset)
         dataset_split.episodes = selected[split_id::split_num]
         instructions = [episode_instruction(episode) for episode in selected]
@@ -390,6 +422,8 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             "split_num": split_num, "split_id": split_id,
             "selected_count": len(dataset_split.episodes),
         }
+        # Diagnostic fallback only: the formal path always associates Pilot
+        # metadata through episode_metadata, keyed by Episode identity.
         for index, episode in enumerate(selected):
             episode_order[
                 (scene_basename(episode.scene_id), str(episode.episode_id))
@@ -451,6 +485,7 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
         },
         manifest_audit=manifest_audit,
         episode_order=episode_order,
+        episode_metadata=episode_metadata,
         execution_manifest=execution_manifest,
         execution_report=execution_report,
         exp_config=exp_config,
@@ -490,6 +525,7 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                    seed: int = 42, l3_options: dict | None = None,
                    manifest_audit: dict | None = None,
                    episode_order: dict | None = None,
+                   episode_metadata: dict | None = None,
                    execution_manifest=None,
                    execution_report: dict | None = None,
                    exp_config: str = "",
@@ -503,6 +539,9 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
         and l3_options.get("seg_model")
     ):
         raise ValueError("baseline group must not receive an L3 segmentation model")
+
+    if episode_metadata is None and execution_manifest is not None:
+        episode_metadata = metadata_from_execution_manifest(execution_manifest)
 
     env = Env(config.TASK_CONFIG, dataset)
     l3_sidecar = None
@@ -544,8 +583,9 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
         "split_num": int(split_num),
         "seed": int(seed),
         "seed_protocol": (
-            "sha256(seed,scene,episode) per Episode, applied before env.reset() "
-            "and before the model call"
+            "sha256(seed,scene,episode) per actual Episode, applied after "
+            "env.reset() has identified the Episode and before agent.reset() "
+            "and the model call"
         ),
         "exp_save": exp_save,
         "pilot_manifest": (
@@ -569,8 +609,7 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
             and manifest_audit.get("expected_count") == EXPECTED_EPISODES
         ),
         "episode_manifest_verified": bool(
-            manifest_audit is not None
-            and manifest_audit.get("episode_manifest", {}).get("verified")
+            ((manifest_audit or {}).get("episode_manifest") or {}).get("verified")
         ),
         "episode_manifest_aligned": bool(
             execution_manifest is not None
@@ -652,12 +691,27 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
     _write_run_metadata(os.path.join(result_path, "run_config.json"), run_metadata)
 
     num_episodes = len(env.episodes)
-    planned_episodes = list(env.episodes)
-    if len(planned_episodes) != num_episodes:
+    assigned_episodes = list(env.episodes)
+    if len(assigned_episodes) != num_episodes:
         raise RuntimeError("env.episodes changed length before evaluation")
-    execution_rows = (
-        execution_manifest.index() if execution_manifest is not None else {}
+    tracker = EpisodeExecutionTracker(
+        assigned_episodes,
+        episode_metadata,
+        require_full_metadata=(
+            episode_metadata is not None
+            and split_num == 1
+            and num_episodes > 0
+        ),
+        context=(
+            "the frozen 88-Episode Pilot"
+            if episode_metadata is not None else "this evaluation split"
+        ),
     )
+    if tracker.expected_count != num_episodes:
+        raise RuntimeError(
+            "the Episode identity tracker did not receive the complete "
+            "assigned execution set"
+        )
     EARLY_STOP_ROTATION = config.EVAL.EARLY_STOP_ROTATION
     EARLY_STOP_STEPS = config.EVAL.EARLY_STOP_STEPS
 
@@ -668,36 +722,43 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
 
     results_path = os.path.join(result_path, "results.jsonl")
     try:
-        for episode_index in trange(
+        for habitat_execution_index in trange(
             num_episodes, desc=config.EVAL.IDENTIFICATION+"-{}".format(split_id),
         ):
             episode_started = time.perf_counter()
-            planned_episode = planned_episodes[episode_index]
-            episode_seed = _stable_episode_seed(
-                seed, str(planned_episode.scene_id),
-                str(planned_episode.episode_id),
-            )
-            # Seed before env.reset() as well as before the model call so both
-            # groups start the same Episode from the same RNG state.
-            random.seed(episode_seed)
-            np.random.seed(episode_seed)
             try:
-                import torch
-                torch.manual_seed(episode_seed)
-            except ImportError:
-                pass
-            obs = env.reset()
+                obs = env.reset()
+            except StopIteration as exc:
+                missing = tracker.missing_keys()
+                raise EpisodeExecutionError(
+                    "Habitat's Episode iterator ended before the expected "
+                    f"execution set was covered; missing {len(missing)} "
+                    "Episode(s): "
+                    + ", ".join(
+                        f"{scene}/{episode}"
+                        for scene, episode in missing[:5]
+                    )
+                    + (" ..." if len(missing) > 5 else "")
+                ) from exc
+
+            # The actual Episode, not the dataset/list position, is the only
+            # source of truth for identity and manifest metadata.
             episode = env.current_episode
-            if (
-                str(episode.scene_id), str(episode.episode_id)
-            ) != (
-                str(planned_episode.scene_id), str(planned_episode.episode_id)
-            ):
-                raise RuntimeError(
-                    "env.reset() did not return the Episode at the expected "
-                    f"index {episode_index}; manifest order would be violated"
-                )
+            episode_key, episode_meta = tracker.accept(episode)
+            scene_id = str(episode.scene_id)
+            episode_id = str(episode.episode_id)
+            episode_seed = _stable_episode_seed(seed, scene_id, episode_id)
+            _seed_episode_rngs(episode_seed)
             instruction = episode_instruction(episode)
+            if (
+                episode_meta is not None
+                and episode_meta.instruction is not None
+                and instruction != episode_meta.instruction
+            ):
+                raise EpisodeExecutionError(
+                    "Episode instruction differs from the frozen manifest for "
+                    f"{episode_key[0]}/{episode_key[1]}"
+                )
             if model_name == "uni-navid":
                 agent.reset(episode=episode, instruction=instruction)
             else:
@@ -717,7 +778,7 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                     continuse_rotation_count +=1
 
 
-                action = agent.act(obs, info, env.current_episode.episode_id)
+                action = agent.act(obs, info, episode_id)
 
                 if continuse_rotation_count > EARLY_STOP_ROTATION or iter_step>EARLY_STOP_STEPS:
                     action = {"action": 0}
@@ -727,58 +788,11 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
 
             info = env.get_metrics()
             episode_time_sec = time.perf_counter() - episode_started
-            result_dict = dict()
-            result_dict = {k: _json_value(info[k]) for k in target_key if k in info}
-            result_dict["id"] = env.current_episode.episode_id
-            result_dict["scene_id"] = str(env.current_episode.scene_id)
-            result_dict["instruction"] = instruction
-            result_dict["instruction_sha256"] = hashlib.sha256(
-                instruction.encode("utf-8")
-            ).hexdigest()
+            result_dict = {
+                k: _json_value(info[k]) for k in target_key if k in info
+            }
             result_dict["episode_time_sec"] = episode_time_sec
-            result_dict["episode_seed"] = episode_seed
             result_dict["iter_steps"] = iter_step
-            result_dict["group"] = experiment_group
-            result_dict["pilot_manifest_file_sha256"] = (
-                manifest_audit.get("file_sha256") if manifest_audit else None
-            )
-            result_dict["parent_manifest_sha256"] = (
-                manifest_audit.get("parent_manifest", {}).get(
-                    "declared_sha256_in_pilot"
-                )
-                if manifest_audit else None
-            )
-            result_dict["episode_manifest_canonical_sha256"] = (
-                manifest_audit.get("episode_manifest", {}).get(
-                    "canonical_sha256"
-                )
-                if manifest_audit else None
-            )
-            result_dict["episode_manifest_verified"] = bool(
-                manifest_audit is not None
-                and manifest_audit.get("episode_manifest", {}).get("verified")
-            )
-            episode_key = (
-                scene_basename(env.current_episode.scene_id),
-                str(env.current_episode.episode_id),
-            )
-            execution_row = execution_rows.get(episode_key)
-            result_dict["manifest_order_index"] = (
-                execution_row.execution_index if execution_row is not None
-                else (episode_order or {}).get(episode_key)
-            )
-            result_dict["execution_order"] = (
-                (manifest_audit or {}).get("execution_order")
-            )
-            result_dict["distance_group"] = (
-                execution_row.distance_group if execution_row is not None else None
-            )
-            result_dict["pilot_manifest_index"] = (
-                execution_row.pilot_index if execution_row is not None else None
-            )
-            result_dict["scene_basename"] = scene_basename(
-                env.current_episode.scene_id
-            )
             result_dict["success"] = bool(info.get("success", False))
             result_dict["spl"] = _finite_float(info.get("spl"))
             result_dict["ndtw"] = _finite_float(info.get("ndtw"))
@@ -793,29 +807,68 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
             result_dict["steps_taken"] = _json_value(info.get("steps_taken"))
             if hasattr(agent, "episode_summary"):
                 result_dict.update(agent.episode_summary())
-            # Authoritative Episode identity from the environment, after any
-            # optional agent summary (the summary may omit it in a test double).
-            result_dict["id"] = str(env.current_episode.episode_id)
-            result_dict["episode_id"] = str(env.current_episode.episode_id)
-            result_dict["scene_id"] = str(env.current_episode.scene_id)
-            result_dict["scene_basename"] = scene_basename(
-                env.current_episode.scene_id
+
+            parent_manifest = (manifest_audit or {}).get("parent_manifest") or {}
+            episode_manifest = (
+                (manifest_audit or {}).get("episode_manifest") or {}
             )
-            result_dict["instruction"] = instruction
-            result_dict["instruction_sha256"] = hashlib.sha256(
-                instruction.encode("utf-8")
-            ).hexdigest()
-            result_dict["group"] = experiment_group
-            result_dict["experiment_group"] = experiment_group
+            # Authoritative identity and manifest metadata, written after any
+            # optional agent summary so a test double cannot override them.
+            result_dict.update({
+                "id": episode_id,
+                "episode_id": episode_id,
+                "scene_id": scene_id,
+                "scene_basename": episode_key[0],
+                "instruction": instruction,
+                "instruction_sha256": hashlib.sha256(
+                    instruction.encode("utf-8")
+                ).hexdigest(),
+                "episode_seed": episode_seed,
+                # Diagnostic only: the actual Habitat reset position.  It is
+                # never used to look up manifest metadata.
+                "habitat_execution_index": habitat_execution_index,
+                "manifest_order_index": (
+                    episode_meta.manifest_order_index
+                    if episode_meta is not None
+                    else (episode_order or {}).get(episode_key)
+                ),
+                "pilot_manifest_index": (
+                    episode_meta.pilot_manifest_index
+                    if episode_meta is not None else None
+                ),
+                "distance_group": (
+                    episode_meta.distance_group
+                    if episode_meta is not None else None
+                ),
+                "execution_order": (
+                    (manifest_audit or {}).get("execution_order")
+                ),
+                "group": experiment_group,
+                "experiment_group": experiment_group,
+                "pilot_manifest_file_sha256": (
+                    manifest_audit.get("file_sha256")
+                    if manifest_audit else None
+                ),
+                "parent_manifest_sha256": parent_manifest.get(
+                    "declared_sha256_in_pilot"
+                ),
+                "episode_manifest_canonical_sha256": episode_manifest.get(
+                    "canonical_sha256"
+                ),
+                "episode_manifest_verified": bool(
+                    episode_manifest.get("verified")
+                ),
+            })
 
             if "data" in exp_save:
-                with open(os.path.join(os.path.join(result_path, "log"),"stats_{}.json".format(env.current_episode.episode_id)), "w") as f:
+                with open(os.path.join(os.path.join(result_path, "log"),"stats_{}.json".format(episode_id)), "w") as f:
                     json.dump(_json_safe(result_dict), f, indent=4)
 
             with open(results_path, "a", encoding="utf-8") as stream:
                 stream.write(
                     json.dumps(_json_safe(result_dict), ensure_ascii=False) + "\n"
                 )
+        tracker.assert_complete()
     finally:
         close = getattr(agent, "close", None)
         if callable(close):

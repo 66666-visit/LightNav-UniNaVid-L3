@@ -331,10 +331,16 @@ def main(argv: list[str] | None = None) -> int:
             f"found A={len(baseline_rows)}, B={len(l3_rows)}"
         )
     for a_row, b_row in zip(baseline_rows, l3_rows):
+        a_key = (a_row["scene_basename"], a_row["episode_id"])
+        b_key = (b_row["scene_basename"], b_row["episode_id"])
+        if a_key != b_key:
+            raise ValueError(
+                f"A/B rows are not key-paired: {a_key} vs {b_key}"
+            )
         if a_row.get("instruction_sha256") != b_row.get("instruction_sha256"):
             raise ValueError(
                 "A/B instruction differs for "
-                f"{a_row['scene_basename']}/{a_row['episode_id']}"
+                f"{a_key[0]}/{a_key[1]}"
             )
 
     manifest_sha = None
@@ -345,6 +351,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         manifest_sha = manifest.file_sha256
         manifest_report = manifest.audit()
+        # Both groups must cover exactly the frozen 88-task set; equal A/B
+        # sets alone would not catch two identically wrong sets.
+        manifest_keys = set(manifest.keys())
+        for name, keys in (
+            ("baseline", baseline_keys), ("l3", l3_keys),
+        ):
+            if keys != manifest_keys:
+                raise ValueError(
+                    f"{name} Episode set differs from the frozen manifest: "
+                    f"missing={sorted(manifest_keys - keys)[:5]}, "
+                    f"extra={sorted(keys - manifest_keys)[:5]}"
+                )
         for row in baseline_rows + l3_rows:
             recorded = (
                 row.get("pilot_manifest_sha256") or row.get("manifest_sha256")

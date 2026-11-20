@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -55,6 +56,28 @@ def _write_group(root: Path, rows: list[dict]) -> None:
     )
 
 
+def _write_pilot_manifest(tmp_path: Path, rows: list[dict]):
+    episode_rows = [
+        {
+            "scene_id": (
+                "/data/scene_datasets/hm3d/" + row["scene_basename"]
+            ),
+            "habitat_episode_id": row["episode_id"],
+        }
+        for row in rows
+    ]
+    data = {
+        "protocol_version": "rgm_pilot_88_v1",
+        "dataset_split": "val_unseen",
+        "sample_seed": 42,
+        "expected_count": 88,
+        "episodes": episode_rows,
+    }
+    path = tmp_path / "pilot_manifest.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def test_report_writes_all_required_artifacts(tmp_path) -> None:
     baseline = tmp_path / "baseline"
     l3 = tmp_path / "l3"
@@ -96,6 +119,26 @@ def test_report_writes_all_required_artifacts(tmp_path) -> None:
     assert "Uni-NaVid L3-only paired experiment report" in report
     assert "Exact McNemar" in report
     assert "A fail → B success: 5" in report
+
+
+def test_report_rejects_a_same_but_non_frozen_episode_set(tmp_path) -> None:
+    baseline = tmp_path / "baseline"
+    l3 = tmp_path / "l3"
+    baseline_rows = _rows(l3=False)
+    l3_rows = _rows(l3=True)
+    # Both groups agree with each other, but one task is outside the Pilot.
+    baseline_rows[0]["episode_id"] = "ep-extra"
+    l3_rows[0]["episode_id"] = "ep-extra"
+    _write_group(baseline, baseline_rows)
+    _write_group(l3, l3_rows)
+    manifest_path, digest = _write_pilot_manifest(tmp_path, _rows(l3=False))
+    with pytest.raises(ValueError, match="frozen manifest"):
+        build_l3_report.main([
+            "--baseline", str(baseline), "--l3", str(l3),
+            "--output", str(tmp_path / "out"),
+            "--manifest", str(manifest_path),
+            "--expected-sha256", digest,
+        ])
 
 
 def test_report_rejects_mismatched_episode_sets(tmp_path) -> None:
