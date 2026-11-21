@@ -18,6 +18,8 @@
 #   GPU_ID              default: 0
 #   CHUNKS              default: 1
 #   GROUP               one of the eight groups; default: all eight
+#   RESOLVE_GROUPS_ONLY 1 = validate and print the selected group names, then
+#                       exit before checking models/manifests or starting one
 #   PYTHON_BIN          default: python
 #   PILOT_MANIFEST_SHA256 / EPISODE_MANIFEST_SHA256 (fixed)
 #   SEG_DEVICE / L1_DEVICE / PLACE_DEVICE
@@ -52,7 +54,50 @@ EXPECTED_EPISODE_MANIFEST_SHA256="${EXPECTED_EPISODE_MANIFEST_SHA256:-30260e81e9
 FIXED_EPISODE_MANIFEST_SHA256="30260e81e98a0f368cc214b095d9f1c4c43a65e7332e2dc6d7f89e80ae9eac98"
 CONFIRM="${CONFIRM:-NO}"
 LOG_PROMPTS="${LOG_PROMPTS:-1}"
-GROUPS=(l1_original_only l1_organized_only l3_original_only l3_organized_only l1_l3_original_concat l1_l3_joint l1_original_l3_organized_concat l1_original_l3_organized_joint)
+# Deliberately not named GROUPS: that is a Bash special array of the current
+# user's supplementary group IDs.  Under root, GROUPS=(...) is ignored and
+# "all" would expand to the literal group id 0, which is not an experiment.
+ABLATION_GROUPS=(
+    l1_original_only l1_organized_only l3_original_only l3_organized_only
+    l1_l3_original_concat l1_l3_joint
+    l1_original_l3_organized_concat l1_original_l3_organized_joint
+)
+EXPECTED_ABLATION_GROUP_COUNT=8
+
+resolve_selected_groups() {
+    local candidate found
+    if [ "$GROUP" = "all" ]; then
+        [ "${#ABLATION_GROUPS[@]}" -eq "$EXPECTED_ABLATION_GROUP_COUNT" ] \
+            || die "internal error: expected $EXPECTED_ABLATION_GROUP_COUNT groups, got ${#ABLATION_GROUPS[@]}"
+        SELECTED_GROUPS=("${ABLATION_GROUPS[@]}")
+    else
+        found=0
+        for candidate in "${ABLATION_GROUPS[@]}"; do
+            [ "$GROUP" = "$candidate" ] && found=1
+        done
+        [ "$found" = "1" ] \
+            || die "GROUP must be 'all' or one of: ${ABLATION_GROUPS[*]}"
+        SELECTED_GROUPS=("$GROUP")
+    fi
+    # De-duplicate and require exactly one entry per selected experiment.  A
+    # special/overridden array can never silently launch a duplicate group.
+    local unique=() seen=""
+    for candidate in "${SELECTED_GROUPS[@]}"; do
+        case " $seen " in
+            *" $candidate "*) die "duplicate experiment group selected: $candidate" ;;
+        esac
+        seen="$seen $candidate"
+        unique+=("$candidate")
+    done
+    SELECTED_GROUPS=("${unique[@]}")
+    [ "${#SELECTED_GROUPS[@]}" -ge 1 ] || die "no experiment group selected"
+}
+
+resolve_selected_groups
+if [ "${RESOLVE_GROUPS_ONLY:-0}" = "1" ]; then
+    printf '%s\n' "${SELECTED_GROUPS[@]}"
+    exit 0
+fi
 
 [ "${NO_FORCE_STOP:-1}" = "1" ] || die "NO_FORCE_STOP must be 1 for the formal ablation"
 if [ "$EXPECTED_EPISODE_MANIFEST_SHA256" != "$FIXED_EPISODE_MANIFEST_SHA256" ]; then
@@ -71,16 +116,6 @@ fi
 [ -f "$CONFIG_PATH" ] || die "Habitat config not found: $CONFIG_PATH"
 case "$CHUNKS" in ''|*[!0-9]*) die "CHUNKS must be a positive integer" ;; esac
 [ "$CHUNKS" -ge 1 ] || die "CHUNKS must be at least 1"
-if [ "$GROUP" != "all" ]; then
-    found=0
-    for candidate in "${GROUPS[@]}"; do
-        [ "$GROUP" = "$candidate" ] && found=1
-    done
-    [ "$found" = "1" ] || die "GROUP must be one of: ${GROUPS[*]}"
-    SELECTED_GROUPS=("$GROUP")
-else
-    SELECTED_GROUPS=("${GROUPS[@]}")
-fi
 NEEDS_SEG=0
 for group in "${SELECTED_GROUPS[@]}"; do
     l3_required=$(PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" - "$group" <<'PY'
@@ -130,13 +165,21 @@ print(f"{group}: {spec['combination']} l1={spec['l1_builder']} l3={spec['l3_buil
 PY
 done
 
-mkdir -p "$OUTPUT_ROOT/logs"
 if [ "$CONFIRM" = "YES" ]; then
+    # Every output path is checked before the first model is constructed.  A
+    # failed preflight must not leave an empty/partial formal result directory.
     for group in "${SELECTED_GROUPS[@]}"; do
-        if [ -e "$OUTPUT_ROOT/$group/results.jsonl" ]; then
-            die "$OUTPUT_ROOT/$group/results.jsonl exists; use a fresh OUTPUT_ROOT (no silent append)"
+        result_dir="$OUTPUT_ROOT/$group"
+        for marker in results.jsonl execution_manifest.json run_config.json; do
+            if [ -e "$result_dir/$marker" ]; then
+                die "$result_dir/$marker exists; use a fresh OUTPUT_ROOT (no silent append)"
+            fi
+        done
+        if [ -e "$result_dir" ] && [ -n "$(ls -A "$result_dir" 2>/dev/null)" ]; then
+            die "$result_dir is not empty; use a fresh OUTPUT_ROOT"
         fi
     done
+    mkdir -p "$OUTPUT_ROOT/logs"
 fi
 
 run_group() {
@@ -151,7 +194,9 @@ PY
 )
     read -r l1_required l3_required <<< "$meta"
     local result_dir="$OUTPUT_ROOT/$group"
-    mkdir -p "$result_dir"
+    if [ "$CONFIRM" = "YES" ]; then
+        mkdir -p "$result_dir"
+    fi
     local common=(
         --exp-config "$CONFIG_PATH"
         --exp-save data
@@ -205,10 +250,29 @@ PY
             printf '\n'
             continue
         fi
+        # Keep a failed shard out of the formal result path.  The partial
+        # directory is moved (not deleted) so the stack trace stays auditable,
+        # while a re-run of the launcher still sees a fresh OUTPUT_ROOT.
+        set +e
         CUDA_VISIBLE_DEVICES="$GPU_ID" PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
             L3_LOG_PROMPTS="$LOG_PROMPTS" \
             "$PYTHON_BIN" run.py "${common[@]}" --split-id "$shard" \
             2>&1 | tee "$OUTPUT_ROOT/logs/${group}_shard${shard}.log"
+        pipeline_status=("${PIPESTATUS[@]}")
+        set -e
+        run_status="${pipeline_status[0]:-1}"
+        tee_status="${pipeline_status[1]:-0}"
+        if [ "$run_status" -ne 0 ] || [ "$tee_status" -ne 0 ]; then
+            failed_root="$OUTPUT_ROOT/failed"
+            case "$result_dir" in
+                "$OUTPUT_ROOT"/*) ;;
+                *) die "refusing to move an unexpected result path: $result_dir" ;;
+            esac
+            mkdir -p "$failed_root"
+            failed_dir="$failed_root/${group}.$(date -u +%Y%m%dT%H%M%SZ).$$"
+            [ ! -d "$result_dir" ] || mv "$result_dir" "$failed_dir"
+            die "group $group shard $shard failed (run=$run_status tee=$tee_status); partial output moved to $failed_dir"
+        fi
     done
 }
 

@@ -611,6 +611,24 @@ class PromptMemoryBackend:
             token_budget=token_budget,
             budget_failure=budget_failure,
         )
+        try:
+            from l1_integration.memory_diagnostics import diagnose_prompt_pipeline
+
+            result.diagnostics["pipeline"] = diagnose_prompt_pipeline(
+                result=result,
+                store=self.v3_store,
+                object_map=self.object_map,
+                scene_id=self.scene_id,
+                episode_id=self.working.state.episode_id,
+                rollout_idx=self.v3_rollout_idx,
+                step=step,
+                instruction=instruction,
+                events=self._step_events,
+                min_confidence=self.min_injection_confidence,
+                scope=self.local_graph_config.scope,
+            )
+        except Exception as exc:  # noqa: BLE001 - diagnostics must fail open
+            result.diagnostics["pipeline_error"] = f"{type(exc).__name__}: {exc}"
         if self.plan.l1_source == "original" and not result.local_graph_pending:
             self._active_prompt_fusion.discard_selection()
         self.last_prompt_context = result

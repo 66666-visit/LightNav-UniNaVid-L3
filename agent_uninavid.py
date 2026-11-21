@@ -734,7 +734,6 @@ class UniNaVid_Agent(Agent):
         row.setdefault("prompt_has_l1", False)
         row.setdefault("fact_count", 0)
         row.setdefault("context_chars", 0)
-        row.setdefault("context_tokens", 0)
         row.setdefault("frame_valid", False)
         row.setdefault("frame_error", None)
         # Keep the original diagnostic aliases populated for the existing
@@ -744,11 +743,20 @@ class UniNaVid_Agent(Agent):
         row.setdefault("segmentation_ms", l3_observe or None)
         row.setdefault("observe_ms", l1_observe + l3_observe)
         row.setdefault("retrieval_ms", row.get("prompt_build_ms"))
-        row.setdefault("context_tokens", self._count_tokens(
-            row.get("memory_context_text") or ""
-        ))
-        if row.get("memory_context_text") and not row.get("context_chars"):
+        # ``context_tokens`` is the tokenizer count of the exact memory text
+        # that was injected.  ``memory_tokens_injected`` below is the measured
+        # delta of the assembled official prompt; the two are related but not
+        # interchangeable.  Never pre-seed context_tokens with 0: setdefault
+        # would then hide the real count (the old smoke bug).
+        if row.get("context_tokens") is None:
+            memory_text = row.get("memory_context_text")
+            row["context_tokens"] = (
+                self._count_tokens(memory_text) or 0
+                if isinstance(memory_text, str) and memory_text.strip() else 0
+            )
+        if isinstance(row.get("memory_context_text"), str):
             row["context_chars"] = len(row["memory_context_text"])
+        row.setdefault("memory_tokens_injected", None)
         self.step_diagnostics.append(row)
         stream = getattr(self, "_steps_stream", None)
         if stream is not None and not stream.closed:
@@ -1003,6 +1011,10 @@ class UniNaVid_Agent(Agent):
         selected = list(context.layer_items) if context is not None else []
         l1_selected = [item for item in selected if _item_has_l1(item)]
         l3_selected = [item for item in selected if _item_has_l3(item)]
+        context_fact_count = sum(
+            1 for item in selected if _item_has_l1(item) or _item_has_l3(item)
+        )
+        context_has_facts = context_fact_count > 0
         l1_evidence_ids = list(dict.fromkeys(
             evidence_id
             for item in l1_selected
@@ -1019,6 +1031,10 @@ class UniNaVid_Agent(Agent):
                 or [ref.event_id for ref in item.evidence_refs]
             )
         ))
+        pipeline = details.get("pipeline") or {}
+        l1_pipeline = dict(pipeline.get("l1") or {})
+        l3_pipeline = dict(pipeline.get("l3") or {})
+        joint_pipeline = dict(pipeline.get("joint") or {})
         diagnostic.update({
             "mode": details.get("mode", getattr(
                 getattr(result, "plan", None), "mode", self.memory_prompt_mode,
@@ -1045,10 +1061,65 @@ class UniNaVid_Agent(Agent):
             "duplicates_removed": duplicates,
             "conflict_count": len(conflicts),
             "omitted_items": omitted,
-            "retrieved_nodes": int(
-                map_summary.get("objects", 0) or 0
-                if l3 else (l1.get("fact_count", 0) or 0)
+            # ``retrieved_nodes`` counts prompt candidates, not every node in
+            # the map.  The old code reported map_snapshot()["objects"], which
+            # made a non-empty map look like non-empty retrieved memory.
+            "retrieved_nodes": (
+                int(l3.get("candidate_count", 0) or 0)
+                if l3 else int(l1.get("fact_count", 0) or 0)
             ),
+            "l3_retrieved_candidate_count": int(
+                l3.get("candidate_count", 0) or 0
+            ),
+            "map_object_nodes": int(map_summary.get("objects", 0) or 0),
+            "l1_detection_events": int(
+                l1_pipeline.get("current_detection_events", 0) or 0
+            ),
+            "l1_current_relevant_records": int(
+                l1_pipeline.get("current_instruction_relevant_records", 0) or 0
+            ),
+            "l1_history_eligible_relevant_records": int(
+                l1_pipeline.get("history_eligible_relevant_records", 0) or 0
+            ),
+            "l1_rejected_irrelevant": int(
+                l1_pipeline.get("current_rejected_irrelevant_records", 0) or 0
+            ),
+            "l1_rejected_below_confidence": int(
+                l1_pipeline.get("current_below_prompt_floor_records", 0) or 0
+            ),
+            "l1_rejected_missing_evidence": int(
+                l1_pipeline.get("current_missing_evidence_records", 0) or 0
+            ),
+            "l3_map_object_count": int(
+                l3_pipeline.get("map_object_count", 0) or 0
+            ),
+            "l3_relevance_rejected": int(
+                l3_pipeline.get("relevance_rejected_count", 0) or 0
+            ),
+            "l3_current_only_skipped": int(
+                l3_pipeline.get("current_only_relevant_count", 0) or 0
+            ),
+            "l3_history_unavailable": int(
+                l3_pipeline.get("history_unavailable_relevant_count", 0) or 0
+            ),
+            "joint_l3_facts_considered": int(
+                joint_pipeline.get("l3_facts_considered", 0)
+                or alignment.get("l3_facts_considered", 0) or 0
+            ),
+            "joint_candidate_pairs": int(
+                joint_pipeline.get("attempted_alignments", 0)
+                or alignment.get("attempted", 0) or 0
+            ),
+            "joint_reported_aligned_pairs": int(
+                joint_pipeline.get("reported_aligned_pairs", 0) or 0
+            ),
+            "context_has_facts": context_has_facts,
+            "context_fact_count": context_fact_count,
+            "prompt_has_l1_fact": bool(l1_selected),
+            "prompt_has_l3_fact": bool(l3_selected),
+            "memory_block_kind": (
+                "facts" if context_has_facts else "fixed_hint"
+            ) if context is not None else "none",
             "evidence_ids": evidence_ids,
             "l1_evidence_ids": l1_evidence_ids,
             "l3_evidence_ids": l3_evidence_ids,
@@ -1171,6 +1242,13 @@ class UniNaVid_Agent(Agent):
             )
             memo_diagnostic["memory_tokens_injected"] = memory_tokens
             memo_diagnostic["token_overflow_drops"] = drops
+            memo_diagnostic["context_chars"] = (
+                len(memory_text) if isinstance(memory_text, str) else 0
+            )
+            memo_diagnostic["context_tokens"] = (
+                self._count_tokens(memory_text) or 0
+                if isinstance(memory_text, str) and memory_text.strip() else 0
+            )
             if isinstance(memo_diagnostic.get("token_budget"), dict):
                 memo_diagnostic["token_budget"] = dict(
                     memo_diagnostic["token_budget"]

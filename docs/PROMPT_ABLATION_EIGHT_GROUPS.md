@@ -2,6 +2,9 @@
 
 > 状态：**代码级验收已完成**；CPU Smoke 通过；真实 Habitat + Uni-NaVid checkpoint +
 > GPU 的 Episode 推理未在本机执行（本机无可用 GPU、无 Habitat、无 checkpoint）。
+> AutoDL 已由操作者执行过 `l1_l3_joint` 单 Episode Smoke；其
+> `output/eight_group_smoke_20261121_100659/` 产物不在当前 checkout，本文不对该
+> 次数值做本地复现声明，只保留只读归因方法。
 > 本文件不声称任何导航指标改善。
 >
 > 未修改模型权重、官方视觉编码器、视频输入路径、动作解析/解码逻辑、冻结
@@ -187,8 +190,18 @@ available     = context_limit - base_tokens - reserve - 1
 
 - `prompt_sha256`、`prompt_tokens`、`memory_tokens_injected`、`token_budget`；
 - `l1_fact_count`、`l3_fact_count`、`evidence_ids`、`l1_evidence_ids`、`l3_evidence_ids`、`l1_fact_ids`、`l3_fact_ids`；
-- `retrieved_nodes`、`duplicates_removed`、`conflict_count`、`omitted_items`、
-  `token_overflow_drops`；
+- `context_tokens`、`context_chars`、`memory_tokens_injected`、`context_has_facts`、
+  `memory_block_kind`（`facts` / `fixed_hint` / `none`）、`context_fact_count`、
+  `prompt_has_l1_fact`、`prompt_has_l3_fact`；
+- `retrieved_nodes`（Prompt 候选数，不是地图节点数）、`map_object_nodes`、
+  `l3_retrieved_candidate_count`、`duplicates_removed`、`conflict_count`、
+  `omitted_items`、`token_overflow_drops`；
+- 零事实归因：`l1_detection_events`、`l1_current_relevant_records`、
+  `l1_rejected_irrelevant`、`l1_rejected_below_confidence`、
+  `l1_rejected_missing_evidence`、`l3_map_object_count`、`l3_relevance_rejected`、
+  `l3_current_only_skipped`、`l3_history_unavailable`、
+  `joint_l3_facts_considered`、`joint_candidate_pairs`、
+  `joint_reported_aligned_pairs`；
 - `l1_observe_ms`、`l3_observe_ms`、`prompt_build_ms`、`token_budget_ms`、
   `retrieval_ms`；
 - `context_injected`、`prompt_has_l1`、`prompt_has_l3`；
@@ -196,6 +209,42 @@ available     = context_limit - base_tokens - reserve - 1
 
 正式 launcher 默认 `LOG_PROMPTS=1`。`run_config.json` 记录组配置、层激活、权重路径、
 `no_force_stop`、`max_episode_steps`；实验组另写 `prompt_protocol.json`。
+
+`context_tokens` 与 `memory_tokens_injected` 是**两个不同口径**：
+
+- `context_tokens`：注入的 memory 文本本身的 tokenizer 计数；
+- `memory_tokens_injected`：把同一文本放进官方模板任务槽后，完整官方 Prompt 的
+  精确 token 增量。
+
+两者不要求相等。此前 `_finish_step` 先用 `setdefault("context_tokens", 0)` 写入 0，
+后面的真实计数被 `setdefault` 忽略，造成“`memory_tokens_injected > 0` 但
+`context_tokens == 0`”的记录错误；该顺序已修正。
+
+### 5.1 零事实归因（不降低门槛）
+
+Prompt 事实层有独立的保守门槛，和检测器阈值不是同一个参数：
+
+- L1 检测器阈值由 `--memory-l1-confidence`（正式 launcher 为 0.25）控制；
+  L1 Prompt 事实仍要求 `raw_detector_confidence >= 0.5`；
+- L3 分割阈值由 `--l3-seg-confidence`（0.25）控制；可作为**历史**事实的
+  L3 证据还要求 `confidence >= --l3-min-confidence`（0.5）。低于该值的当前
+  证据不能生成几何验证事实；只有在没有当前步证据时，才可能形成明确标注为
+  unverified 的 fallback 行；
+- 两层都只注入与指令词有交集的类别（LightNav 的 `_terms` 规则）。
+
+因此“检测/分割有输出、地图有对象、但 fact_count 为 0”可能是数据原因，而不是断链：
+类别不在指令中、置信度在 0.25–0.5 之间、或对象只有当前步证据。诊断脚本会分别报告：
+
+```bash
+python scripts/diagnose_memory_facts.py <run_dir>/l1_l3_joint
+```
+
+其中 `retrieved_nodes` 只统计 Prompt 候选，地图节点数单独记录为
+`map_object_nodes`；`joint_candidate_pairs` 是历史 `attempted` 语义（有 L1 对应
+对象的 L3 fact 数），`joint_l3_facts_considered` 统计所有进入对齐的 L3 fact。
+`l1_l3_joint` 的历史 `aligned_pairs` 只统计独立的 `l3_aligned` 行；两个来源合并成
+一条 joint 行时该字段为 0，应以 `alignment.confirmed` 或
+`joint_candidate_pairs` / `l3_fact_count` 判断是否对齐成功。
 
 ---
 
@@ -206,12 +255,12 @@ Python 3.8（项目 `.venv38`）用于兼容性与纯算法测试。
 
 | 验收项 | 结果 |
 | --- | --- |
-| 完整测试套件 | **191 passed, 0 failed** |
-| 新增测试 | 45（八组/隔离/事实一致性/concat-joint/agent 契约/官方 Prompt 快照/vendoring/入口/配置） |
-| Python 3.8 纯算法子集 | **117 passed, 0 failed** |
+| 完整测试套件 (Python 3.11) | **291 passed, 0 failed** |
+| 本次新增回归 | 20（Bash 启动器 6、事实传播/空事实 7、agent token 统计 3、诊断脚本 4） |
+| Python 3.8 纯算法子集 | **238 passed, 0 failed** |
 | Python 3.8 compileall | `l1_memory l1_integration l3_integration l3_memory scripts tests run.py agent_uninavid.py` 全部通过 |
 | CPU Prompt 消融 Smoke | **64/64 checks passed**；8 组全部构建；原/组织事实集合一致；concat≠joint |
-| 真实 Episode 推理 Smoke | **未执行**：本机 `nvidia-smi` 初始化失败，无 Habitat、无 checkpoint、无 YOLO/DINOv2 权重；已提供 `scripts/smoke_real_episode.sh`（单 Episode，非正式） |
+| 真实 Episode 推理 Smoke | AutoDL 已由操作者执行；本 checkout **未见** `output/eight_group_smoke_20261121_100659/`，因此本文不把其数值计为本地复现结果。可用 `scripts/diagnose_memory_facts.py` 对该目录做只读归因。 |
 
 关键测试文件：
 
@@ -224,6 +273,14 @@ Python 3.8（项目 `.venv38`）用于兼容性与纯算法测试。
 - `tests/test_l1_memory_reuse.py`：13 个 vendored L1 文件的源/目标哈希与
   “只改 import/3.8 helper”逐文件证明。
 - `tests/test_group_entrypoint.py`：八组独立配置、模型层校验、launcher 固定条件。
+- `tests/test_prompt_ablation_launcher_bash.py`：真实 Bash 子进程；`GROUPS=0`
+  的 root-like 环境下 `GROUP=all` 仍展开八个实验组、单组选择、非法组不启动模型、
+  dry-run 不创建输出、失败组移出正式结果路径。
+- `tests/test_memory_fact_pipeline.py`：检测→Evidence→L1/L3 事实、低置信度不提升、
+  不相关类别不注入、L3 当前步不作历史、无效深度不建对象、不同标签不对齐。
+- `tests/test_agent_memory_diagnostics.py`：真实 `act` 路径的 token 口径、
+  固定提示文字、候选数与地图节点数分离、Joint attempted 语义。
+- `tests/test_diagnose_memory_facts.py`：零事实归因分类。
 
 真实单 Episode Smoke（AutoDL，待执行）：
 
@@ -286,7 +343,14 @@ export GPU_ID=0
 export CHUNKS=1
 export NO_FORCE_STOP=1
 
-# 1) 只读 preflight / 打印命令
+# 0) root 特殊数组回归：必须打印 8 个实验组，而不是 0
+env GROUPS=0 RESOLVE_GROUPS_ONLY=1 GROUP=all bash scripts/run_prompt_ablation.sh
+GROUP=l1_l3_joint RESOLVE_GROUPS_ONLY=1 bash scripts/run_prompt_ablation.sh
+
+# 0b) 真实 Bash 回归（含 root-like 展开、dry-run、失败清理）
+python -m pytest -q tests/test_prompt_ablation_launcher_bash.py
+
+# 1) 只读 preflight / 打印八组命令（不会创建 OUTPUT_ROOT）
 CONFIRM=NO bash scripts/run_prompt_ablation.sh
 
 # 2) 八组正式运行
@@ -295,6 +359,20 @@ CONFIRM=YES bash scripts/run_prompt_ablation.sh
 # 3) 单组独立运行
 GROUP=l1_original_only CONFIRM=YES bash scripts/run_prompt_ablation.sh
 GROUP=l1_l3_joint CONFIRM=YES bash scripts/run_prompt_ablation.sh
+
+# 4) 单 Episode 真实 Smoke（非正式，不读/不写冻结 Manifest）
+GROUP=l1_l3_joint CONFIRM=YES bash scripts/smoke_real_episode.sh
+
+# 5) 对 Smoke 的零事实做只读归因（不重跑模型）
+python scripts/diagnose_memory_facts.py \
+  output/eight_group_smoke_20261121_100659/l1_l3_joint
+
+# 6) 全量测试（CPU 主机）与 Python 3.8 兼容子集
+python -m pytest -q
+.venv38/bin/python -m pytest -q tests/test_memory_fact_pipeline.py \
+  tests/test_import_compat.py tests/test_group_entrypoint.py
+.venv38/bin/python -m compileall -q l1_memory l1_integration l3_integration \
+  l3_memory scripts tests run.py agent_uninavid.py
 ```
 
 launcher 会先只读验证冻结 88 Episode 的 Pilot（raw SHA256
