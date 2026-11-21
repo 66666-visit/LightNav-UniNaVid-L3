@@ -2,6 +2,13 @@
 
 ## 0. Status
 
+> **Update (eight-group prompt ablation):** the L1 + L3 migration, the eight
+> independent group configs, the token-aware prompt budget, the CPU smoke test
+> and the formal launcher are documented in
+> [`PROMPT_ABLATION_EIGHT_GROUPS.md`](PROMPT_ABLATION_EIGHT_GROUPS.md).  The
+> existing two-group L3-only path in this document is kept unchanged; it is not
+> one of the eight ablation groups.
+
 Implemented and CPU-tested in `LightNav-UniNaVid-L3` on branch
 `experiment/l3-map-only` (base commit `ce2f804`). No Git commit/push, no AutoDL
 operation, no modification of `LightNav-0-codex`, and no formal 88-Episode run.

@@ -188,3 +188,90 @@ def agent_module_stubs():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+
+class FakeL1Extractor:
+    """Deterministic stand-in for the L1 YOLO11n detector."""
+
+    def __init__(self, by_step=None, *, every_n_steps: int = 1) -> None:
+        self.by_step = dict(by_step or {0: [("chair", 0.9, (1.0, 1.0, 6.0, 6.0))]})
+        self.every_n_steps = every_n_steps
+        self.source = "fake_yolo_detect"
+        self.last_detection_ms = 0.5
+        self.last_error = None
+        self.calls: list[int] = []
+        self.reset_calls: list[tuple[str, str]] = []
+
+    def reset_episode(self, episode_id: str, instruction: str) -> None:
+        self.reset_calls.append((episode_id, instruction))
+
+    def close_episode(self) -> None:
+        pass
+
+    def extract(self, packet):
+        from l3_memory.schemas import DetectedObject, SceneExtraction
+
+        self.calls.append(packet.step_id)
+        if packet.step_id % self.every_n_steps != 0:
+            return SceneExtraction()
+        rows = self.by_step.get(packet.step_id, [])
+        if not rows:
+            return SceneExtraction()
+        detections = [
+            DetectedObject(label=label, confidence=confidence, bbox_xyxy=box)
+            for label, confidence, box in rows
+        ]
+        return SceneExtraction(
+            detections=detections,
+            objects=[item.label for item in detections],
+            confidence=max(item.confidence for item in detections),
+            source=self.source,
+        )
+
+
+class FakePlaceExtractor:
+    """Deterministic DINO-like descriptor; the same vector revisits one place."""
+
+    def __init__(self, descriptor=(1.0, 0.0)) -> None:
+        self.descriptor = tuple(float(value) for value in descriptor)
+        self.source = "fake_dino_place"
+        self.calls: list[int] = []
+
+    def reset_episode(self, episode_id: str, instruction: str) -> None:
+        self.calls.clear()
+
+    def close_episode(self) -> None:
+        pass
+
+    def extract(self, packet):
+        self.calls.append(packet.step_id)
+        return self.descriptor
+
+
+def make_memory_backend(group: str, *, l1=None, seg=None, place=None, **kwargs):
+    from l1_integration.memory_backend import PromptMemoryBackend, group_config
+
+    spec = group_config(group)
+    memory = {
+        "max_landmarks": 2,
+        "max_context_chars": 600,
+        "prompt_max_chars": 320,
+        "place_every_n_steps": 1,
+    }
+    memory.update(kwargs)
+    return PromptMemoryBackend(
+        spec["prompt_mode"],
+        l1_extractor=(l1 if l1 is not None else FakeL1Extractor())
+        if spec["requires_l1_model"] else None,
+        seg_extractor=(seg if seg is not None else FakeExtractor())
+        if spec["requires_seg_model"] else None,
+        place_extractor=(place if place is not None else FakePlaceExtractor())
+        if spec["requires_l1_model"] else None,
+        max_landmarks=memory["max_landmarks"],
+        max_context_chars=memory["max_context_chars"],
+        prompt_max_chars=memory["prompt_max_chars"],
+        scope="episode_local",
+        place_every_n_steps=memory["place_every_n_steps"],
+        seg_source="yolo11n-seg:fake.pt",
+        seg_model_path="fake.pt",
+    )

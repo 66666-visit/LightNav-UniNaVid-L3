@@ -1,0 +1,24 @@
+# Independent Uni-NaVid x LightNav prompt-ablation group.
+# All other conditions (checkpoint, Habitat config, 88-Episode manifest,
+# Episode seed, 500-step cap, NO_FORCE_STOP=1, official decode) are shared.
+group: l1_original_l3_organized_concat
+prompt_mode: l1_original_l3_organized_concat
+layers:
+  l1_prompt: true
+  l3_prompt: true
+  l1_evidence_writer: true
+  l3_map: true
+  combination: concat
+  l1_builder: local_graph_fusion
+  l3_builder: l3_prompt_organizer
+  preserves_l1_verbatim: false
+memory:
+  max_landmarks: 2
+  prompt_max_chars: 320
+  max_context_chars: 600
+  scope: episode_local
+  token_budget: true
+  place_every_n_steps: 5
+  evidence_min_iou: 0.5
+  evidence_ambiguity_margin: 0.1
+  min_injection_confidence: 0.5

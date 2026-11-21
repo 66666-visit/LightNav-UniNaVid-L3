@@ -1,0 +1,25 @@
+{
+  "group": "l1_original_only",
+  "prompt_mode": "l1_original_only",
+  "layers": {
+    "l1_prompt": true,
+    "l3_prompt": false,
+    "l1_evidence_writer": true,
+    "l3_map": false,
+    "combination": "single",
+    "l1_builder": "local_graph_fusion",
+    "l3_builder": null,
+    "preserves_l1_verbatim": false
+  },
+  "memory": {
+    "max_landmarks": 2,
+    "prompt_max_chars": 320,
+    "max_context_chars": 600,
+    "scope": "episode_local",
+    "token_budget": true,
+    "place_every_n_steps": 5,
+    "evidence_min_iou": 0.5,
+    "evidence_ambiguity_margin": 0.1,
+    "min_injection_confidence": 0.5
+  }
+}

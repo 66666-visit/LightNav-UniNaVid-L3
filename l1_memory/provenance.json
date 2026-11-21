@@ -1,0 +1,113 @@
+{
+  "source_repo": "/home/lilixing/projects/LightNav-0-codex",
+  "source_branch": "experiment/l3-official-style-prompt",
+  "source_commit": "6aefffa",
+  "source_commit_subject": "feat: add L3 official-style navigation prompt",
+  "vendored_on": "2026-11-20",
+  "files": [
+    {
+      "name": "local_graph_config.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/local_graph_config.py",
+      "vendored": "l1_memory/local_graph_config.py",
+      "source_sha256": "27093d6e4a638cecbbc6a8c9585500cfabb84e517d0a856dcb86d5b7279f1d0b",
+      "vendored_sha256": "27093d6e4a638cecbbc6a8c9585500cfabb84e517d0a856dcb86d5b7279f1d0b",
+      "change": "import paths only"
+    },
+    {
+      "name": "local_graph_fusion.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/local_graph_fusion.py",
+      "vendored": "l1_memory/local_graph_fusion.py",
+      "source_sha256": "5459e9ddc9cfd1981b72af96c4b5d000ffc88a489941415676e9b488c601d359",
+      "vendored_sha256": "d8389d0b324eb957eb0b09a60bfe27ebf5c2ee3f6b0bb9d1c75b79a8deafac93",
+      "change": "import paths + Python 3.8 removeprefix helper"
+    },
+    {
+      "name": "l1_prompt_organizer.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/l1_prompt_organizer.py",
+      "vendored": "l1_memory/l1_prompt_organizer.py",
+      "source_sha256": "90fcbec6511acec9d4811dd3a667053f454b6a1ff2665e9b7723a317397bd758",
+      "vendored_sha256": "3065e06fae130c83da41b19ea8ef640222cb204ee0ae955af105a6541bc41ae0",
+      "change": "import paths + Python 3.8 removeprefix helper"
+    },
+    {
+      "name": "joint_prompt.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/joint_prompt.py",
+      "vendored": "l1_memory/joint_prompt.py",
+      "source_sha256": "cf6c868dc7dae5f5d19fe46af7184e997901e6fd07aaf24b75ca9f4b04d77c75",
+      "vendored_sha256": "fdf93287e02061ddd3704c7dc3c91addbc4e22da22b0262fa9cd3d36dc431267",
+      "change": "import paths + Python 3.8 removeprefix helper"
+    },
+    {
+      "name": "prompt_modes.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/prompt_modes.py",
+      "vendored": "l1_memory/prompt_modes.py",
+      "source_sha256": "c649187ebcd395fcf2b2088f0cb3e39482830d6fda512aeb8c10a152f1868834",
+      "vendored_sha256": "c649187ebcd395fcf2b2088f0cb3e39482830d6fda512aeb8c10a152f1868834",
+      "change": "import paths only"
+    },
+    {
+      "name": "prompt_assembly.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/prompt_assembly.py",
+      "vendored": "l1_memory/prompt_assembly.py",
+      "source_sha256": "54f4ee70da0813ef4538f1a4f9aba1d277b059210c2dbae4552d99213edc72cf",
+      "vendored_sha256": "01bba15c16cabc1e445821d64c7948df2d174b65677ae41bc3d5bd453d295faa",
+      "change": "import paths only"
+    },
+    {
+      "name": "token_budget.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/token_budget.py",
+      "vendored": "l1_memory/token_budget.py",
+      "source_sha256": "fe47f96ba03fc76bb3132f18e7914e0741b9a81f6395215090c3517b7a8bf4b9",
+      "vendored_sha256": "b9cfede58d266d5f2cdf66aec740f5c795aade8f5145eb787e19569f76919837",
+      "change": "import paths only"
+    },
+    {
+      "name": "memory_writer.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/memory_writer.py",
+      "vendored": "l1_memory/memory_writer.py",
+      "source_sha256": "6ba0924e9ae2fcd96ec5ccffa79f6d36154468210923877d67de0de3e84034e0",
+      "vendored_sha256": "1829936705be86268d3e8175b668945befb0cdaf3129ac57ccc808589a77c751",
+      "change": "import paths + local instruction_match helper hook"
+    },
+    {
+      "name": "episodic_memory.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/episodic_memory.py",
+      "vendored": "l1_memory/episodic_memory.py",
+      "source_sha256": "05754c8731cc10b3e37ebe0734e7bf88e28846ee2b234c18b7b6a0e5e2207eb7",
+      "vendored_sha256": "846f691731d8035b851d16a7f331ea4bbdb60324e3869ad4ce8dfad4cbee60c5",
+      "change": "import paths + Python 3.8 removeprefix helper"
+    },
+    {
+      "name": "scene_graph.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/scene_graph.py",
+      "vendored": "l1_memory/scene_graph.py",
+      "source_sha256": "cfb5232f944f3dbf3913ff2908fba848811ca1cac4547cf0fda95ed627815d65",
+      "vendored_sha256": "a8b335beac6a3aa85cc13c8b269d28555832136ae2c7c053196c3a2888ce52c1",
+      "change": "import paths only"
+    },
+    {
+      "name": "working_memory.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/working_memory.py",
+      "vendored": "l1_memory/working_memory.py",
+      "source_sha256": "d6b57150e8f6a0cab9b8934fd7d5525224ab944bbc8c01fae463cbef213415af",
+      "vendored_sha256": "37ed58e83767c5339a5242200415831b2e79b23e4ce0140b0cc0361adf148fb3",
+      "change": "import paths + Python 3.8 removeprefix helper"
+    },
+    {
+      "name": "yolo_scene_extractor.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/yolo_scene_extractor.py",
+      "vendored": "l1_memory/yolo_scene_extractor.py",
+      "source_sha256": "e56b3cd771e4c90ba4788f0a9ee7f40590da8e7c936c8431433c410389c981b8",
+      "vendored_sha256": "b60b830a2ad213f4d7d67a795ae8c10e1b9a78d2b9c5f3261a101a6e5a0364c1",
+      "change": "import paths only"
+    },
+    {
+      "name": "place_recognition.py",
+      "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/place_recognition.py",
+      "vendored": "l1_memory/place_recognition.py",
+      "source_sha256": "7a8109bf3c86e8d2a838d7728ab087e3f41dec287c78fb83e199ffeb119b7887",
+      "vendored_sha256": "6975dbd962f2702cacfdba88801eb6da8dccf3c81063ce62647d07232ed2be2c",
+      "change": "import paths only"
+    }
+  ]
+}

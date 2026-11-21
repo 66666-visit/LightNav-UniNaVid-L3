@@ -9,6 +9,7 @@ from html import escape
 import numpy as np
 
 from l3_memory.conceptgraphs_lite import InstanceMask
+from l3_memory.compat import removeprefix
 from l3_memory.lexical import _plain_label
 from l3_memory.schemas import LayerMemoryItem, MemoryContext, ObservationEvidence
 from l3_memory.lexical import _terms
@@ -44,7 +45,7 @@ def make_spatial_evidence(
         for event in events:
             if event.kind not in {"object_observation", "landmark"}:
                 continue
-            if event.description.removeprefix("Observed ").strip().casefold() != (
+            if removeprefix(event.description, "Observed ").strip().casefold() != (
                 instance.class_name.casefold()
             ):
                 continue

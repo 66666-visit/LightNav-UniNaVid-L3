@@ -145,6 +145,11 @@ def test_vendored_files_match_recorded_hashes_and_differ_only_in_imports() -> No
         ).replace(
             "from l3_memory.lexical import _terms",
             "from lightnav.memory.v3_retrieval import _terms",
+        ).replace(
+            "from l3_memory.compat import removeprefix\n", "",
+        ).replace(
+            'removeprefix(event.description, "Observed ")',
+            'event.description.removeprefix("Observed ")',
         ).replace("from l3_memory.", "from lightnav.memory.")
         assert normalized == source_text, entry["name"]
 

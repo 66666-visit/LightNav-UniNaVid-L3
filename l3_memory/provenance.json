@@ -18,8 +18,8 @@
       "source": "/home/lilixing/projects/LightNav-0-codex/src/lightnav/memory/spatial_graph_adapter.py",
       "vendored": "l3_memory/spatial_graph_adapter.py",
       "source_sha256": "007695fc3cfc09ad379c5060b07d89750292caf1ccf94c19b4b13b4be6f21c31",
-      "vendored_sha256": "64817e06bfeac9c77cb2fcab0d18317c03dd6865aef4c2ddb69268d204e0e153",
-      "change": "import paths only"
+      "vendored_sha256": "c940ae3d991487c3902e5199e454c171c489d32c3e0110f589e60e91c1c4fbb9",
+      "change": "import path + Python 3.8 removeprefix helper"
     },
     {
       "name": "l3_prompt_organizer.py",
