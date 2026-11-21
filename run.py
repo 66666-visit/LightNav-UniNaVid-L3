@@ -142,7 +142,7 @@ def main():
     )
     parser.add_argument(
         "--experiment-group",
-        choices=("uninavid_baseline", "uninavid_l3_only"),
+        choices=("uninavid_baseline", "uninavid_l3_only", "uninavid_l3_l1_sbadir"),
         default="uninavid_baseline",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -160,6 +160,15 @@ def main():
     parser.add_argument("--l3-max-items", type=int, default=2)
     parser.add_argument("--l3-max-chars", type=int, default=600)
     parser.add_argument("--l3-scope", type=str, default="episode_local")
+    parser.add_argument("--l1-det-model", type=str, default="")
+    parser.add_argument("--l1-det-device", type=str, default="cuda:0")
+    parser.add_argument("--l1-det-confidence", type=float, default=0.25)
+    parser.add_argument("--l1-every-n-steps", type=int, default=5)
+    parser.add_argument("--l1-place-model", type=str, default="")
+    parser.add_argument("--l1-place-device", type=str, default="cuda:0")
+    parser.add_argument("--l1-place-every-n-steps", type=int, default=5)
+    parser.add_argument("--l1-max-items", type=int, default=3)
+    parser.add_argument("--l1-max-tokens", type=int, default=160)
     parser.add_argument(
         "--allow-nonpilot-eval", action="store_true",
         help=(
@@ -257,6 +266,11 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             l3_evidence_ambiguity_margin: float = 0.1,
             l3_min_confidence: float = 0.5, l3_max_items: int = 2,
             l3_max_chars: int = 600, l3_scope: str = "episode_local",
+            l1_det_model: str = "", l1_det_device: str = "cuda:0",
+            l1_det_confidence: float = 0.25, l1_every_n_steps: int = 5,
+            l1_place_model: str = "", l1_place_device: str = "cuda:0",
+            l1_place_every_n_steps: int = 5, l1_max_items: int = 3,
+            l1_max_tokens: int = 160,
             allow_nonpilot_eval: bool = False) -> None:
     """Runs experiment given mode and config
 
@@ -269,8 +283,12 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
         raise ValueError("split-id must lie in [0, split-num)")
     if l3_scope != "episode_local":
         raise ValueError("L3 may not persist across Episodes; use episode_local")
-    if experiment_group == "uninavid_l3_only" and not l3_seg_model:
-        raise ValueError("uninavid_l3_only requires --l3-seg-model")
+    if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"} and not l3_seg_model:
+        raise ValueError("L3 groups require --l3-seg-model")
+    if experiment_group == "uninavid_l3_l1_sbadir" and (not l1_det_model or not l1_place_model):
+        raise ValueError("SBAdir requires --l1-det-model and --l1-place-model")
+    if experiment_group != "uninavid_l3_l1_sbadir" and (l1_det_model or l1_place_model):
+        raise ValueError("only the SBAdir group may receive L1 model paths")
     if experiment_group == "uninavid_baseline" and l3_seg_model:
         raise ValueError("baseline group must not receive an L3 segmentation model")
     if experiment_group != "uninavid_baseline" and model_name != "uni-navid":
@@ -484,6 +502,17 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             "max_chars": l3_max_chars,
             "scope": l3_scope,
         },
+        l1_options={
+            "det_model": l1_det_model,
+            "det_device": l1_det_device,
+            "det_confidence": l1_det_confidence,
+            "every_n_steps": l1_every_n_steps,
+            "place_model": l1_place_model,
+            "place_device": l1_place_device,
+            "place_every_n_steps": l1_place_every_n_steps,
+            "max_items": l1_max_items,
+            "max_tokens": l1_max_tokens,
+        },
         manifest_audit=manifest_audit,
         episode_order=episode_order,
         episode_metadata=episode_metadata,
@@ -520,11 +549,32 @@ def _build_l3_sidecar(config, l3_options):
     return sidecar, camera_spec, l3_config
 
 
+def _build_l1_backend(l1_options):
+    from l1_integration.sbadir_backend import L1EvidenceBackend
+    from l1_memory.place_recognition import DINOv2PlaceDescriptorExtractor
+    from l1_memory.yolo_scene_extractor import YOLOSceneExtractor
+
+    detector = YOLOSceneExtractor(
+        l1_options["det_model"], device=l1_options["det_device"],
+        confidence=l1_options["det_confidence"],
+        every_n_steps=l1_options["every_n_steps"],
+    )
+    place = DINOv2PlaceDescriptorExtractor(
+        l1_options["place_model"], device=l1_options["place_device"],
+    )
+    return L1EvidenceBackend(
+        detector, place_extractor=place,
+        max_landmarks=l1_options["max_items"],
+        place_every_n_steps=l1_options["place_every_n_steps"],
+    )
+
+
 def evaluate_agent(config, split_id, dataset, model_path, result_path, model_name,
                    exp_save, *, split_num: int = 1,
                    experiment_group: str = "uninavid_baseline",
                    seed: int = 42,
                    l3_options: Optional[Dict[str, Any]] = None,
+                   l1_options: Optional[Dict[str, Any]] = None,
                    manifest_audit: Optional[Dict[str, Any]] = None,
                    episode_order: Optional[Dict[Any, Any]] = None,
                    episode_metadata: Optional[Dict[Any, Any]] = None,
@@ -533,8 +583,8 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                    exp_config: str = "",
                    allow_nonpilot_eval: bool = False) -> None:
 
-    if experiment_group == "uninavid_l3_only" and model_name != "uni-navid":
-        raise ValueError("uninavid_l3_only is only defined for uni-navid")
+    if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"} and model_name != "uni-navid":
+        raise ValueError("L3 groups are only defined for uni-navid")
     if (
         experiment_group == "uninavid_baseline"
         and isinstance(l3_options, dict)
@@ -549,10 +599,13 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
     l3_sidecar = None
     camera_spec = None
     l3_config = None
-    if experiment_group == "uninavid_l3_only":
+    if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"}:
         l3_sidecar, camera_spec, l3_config = _build_l3_sidecar(
             config, l3_options or {},
         )
+    l1_backend = None
+    if experiment_group == "uninavid_l3_l1_sbadir":
+        l1_backend = _build_l1_backend(l1_options or {})
 
     if model_name == "navid":
         from agent_navid import NaVid_Agent
@@ -560,9 +613,11 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
 
     elif model_name == "uni-navid":
         from agent_uninavid import UniNaVid_Agent
-        if experiment_group == "uninavid_l3_only":
+        if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"}:
             agent = UniNaVid_Agent(
                 model_path, result_path, exp_save, l3_sidecar=l3_sidecar,
+                l1_backend=l1_backend,
+                l1_max_tokens=(l1_options or {}).get("max_tokens", 160),
                 env=env, config=config, experiment_group=experiment_group,
             )
         else:
@@ -688,6 +743,19 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                 "rgb_key": camera_spec.rgb_key,
                 "depth_key": camera_spec.depth_key,
             },
+        },
+        "l1": None if l1_backend is None else {
+            "det_model": l1_options["det_model"],
+            "det_device": l1_options["det_device"],
+            "det_confidence": l1_options["det_confidence"],
+            "every_n_steps": l1_options["every_n_steps"],
+            "place_model": l1_options["place_model"],
+            "place_device": l1_options["place_device"],
+            "place_every_n_steps": l1_options["place_every_n_steps"],
+            "max_items": l1_options["max_items"],
+            "max_tokens": l1_options["max_tokens"],
+            "fusion": "source_background_augmentation_direct",
+            "source_tree_sha256": os.environ.get("SBADIR_SOURCE_SHA256"),
         },
     }
     _write_run_metadata(os.path.join(result_path, "run_config.json"), run_metadata)

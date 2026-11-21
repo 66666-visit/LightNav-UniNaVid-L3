@@ -13,11 +13,13 @@ from habitat.utils.visualizations import maps
 import random
 
 from l3_integration.official_prompt import (
+    REFERENCE_OFFICIAL_PROMPT_SHA256,
     build_prompt,
     build_task_text,
     prompt_sha256,
     verify_task_text_injection,
 )
+from l3_integration.sbadir_fusion import compose_sbadir
 
 from uninavid.mm_utils import get_model_name_from_path
 from uninavid.model.builder import load_pretrained_model
@@ -55,11 +57,14 @@ def _preserve_rng_state():
 
 class UniNaVid_Agent(Agent):
     def __init__(self, model_path, result_path, exp_save, l3_sidecar=None,
-                 env=None, config=None, experiment_group="uninavid_baseline"):
+                 env=None, config=None, experiment_group="uninavid_baseline",
+                 l1_backend=None, l1_max_tokens=160):
         
         print("Initialize UniNaVid")
 
         self.l3 = l3_sidecar
+        self.l1 = l1_backend
+        self.l1_max_tokens = l1_max_tokens
         self.env = env
         self.config = config
         self.experiment_group = experiment_group
@@ -95,6 +100,8 @@ class UniNaVid_Agent(Agent):
         
         self.promt_template = "Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations and an image of the current observation <image>. Your assigned task is: '{}'. Analyze this series of images to determine your next four actions. The predicted action should be one of the following: forward, left, right, or stop."
         self.prompt_template_sha256 = prompt_sha256(self.promt_template)
+        if self.l1 is not None and self.prompt_template_sha256 != REFERENCE_OFFICIAL_PROMPT_SHA256:
+            raise RuntimeError("SBAdir requires the unchanged official Uni-NaVid prompt")
 
         # self.history_rgb_tensor = None
         
@@ -177,6 +184,9 @@ class UniNaVid_Agent(Agent):
             new_list.append(token_prompt)
         input_ids = torch.cat(new_list, dim=0).unsqueeze(0)
         self.last_prompt_tokens = int(input_ids.shape[1])
+        if (getattr(self, "l1", None) is not None
+                and self.last_prompt_tokens + 1024 > self.context_len):
+            raise RuntimeError("SBAdir exact input tokens exceed checkpoint context reserve")
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         keywords = [stop_str]
@@ -315,7 +325,20 @@ class UniNaVid_Agent(Agent):
         self.last_prompt_text = None
         self.last_task_text = None
         self.last_l3_context_text = None
+        self.last_sbadir_memory_text = None
         self.episode_instruction = instruction
+        if getattr(self, "l1", None) is not None:
+            if episode is None:
+                with _preserve_rng_state():
+                    self.l1.close_episode()
+            else:
+                if not self.episode_instruction:
+                    self.episode_instruction = _episode_instruction(episode)
+                with _preserve_rng_state():
+                    self.l1.reset_episode(
+                        str(episode.scene_id), str(episode.episode_id),
+                        self.episode_instruction,
+                    )
         if getattr(self, "l3", None) is not None:
             if episode is None:
                 # Construction calls reset() before an Episode exists.  Do not
@@ -327,6 +350,25 @@ class UniNaVid_Agent(Agent):
                     self.episode_instruction = _episode_instruction(episode)
                 with _preserve_rng_state():
                     self.l3.reset_episode(episode, self.episode_instruction)
+
+
+    def _observe_l1(self, rgb, step):
+        backend = getattr(self, "l1", None)
+        if backend is None:
+            return {"l1_enabled": False}
+        try:
+            with _preserve_rng_state():
+                _events, result = backend.observe(
+                    rgb, step, rgb_observation_source="observation.rgb",
+                    last_action=self.last_action,
+                )
+            return {"l1_enabled": True, **{
+                "l1_" + str(key): value for key, value in result.items()
+            }}
+        except Exception as exc:
+            # Preserve the navigation path and record the failed RGB channel.
+            return {"l1_enabled": True,
+                    "l1_observe_error": "%s: %s" % (type(exc).__name__, exc)}
 
 
     def _observe_l3(self, observations, step):
@@ -344,10 +386,18 @@ class UniNaVid_Agent(Agent):
             except Exception as exc:  # noqa: BLE001 - report, never invent a pose
                 diagnostic["agent_state_error"] = f"{type(exc).__name__}: {exc}"
         try:
+            backend = getattr(self, "l1", None)
+            link_kwargs = {}
+            if backend is not None and getattr(backend, "last_step", None) == step:
+                link_kwargs = {
+                    "l1_events": backend.last_events,
+                    "l1_store": backend.v3_store,
+                }
             with _preserve_rng_state():
                 observation_diagnostic = sidecar.observe(
                     observations, agent_state, step,
                     transition_record=bool(step > 0),
+                    **link_kwargs,
                 )
         except Exception as exc:  # noqa: BLE001 - optional sidecar fails closed
             observation_diagnostic = {
@@ -430,6 +480,98 @@ class UniNaVid_Agent(Agent):
         return task_text, context_text, diagnostic
 
 
+    def _augment_sbadir_task_text(self, instruction, step, diagnostic):
+        """Add L1 and source records inside the same official task slot."""
+        backend = self.l1
+        sidecar = self.l3
+        if backend is None or sidecar is None:
+            raise RuntimeError("SBAdir requires both real L1 and L3 backends")
+        if not isinstance(instruction, str):
+            raise ValueError("instruction must be text")
+        with _preserve_rng_state():
+            organization, l3_diagnostic = sidecar.build_context(instruction, step)
+        if isinstance(l3_diagnostic, dict):
+            diagnostic.update(l3_diagnostic)
+        l3_context = (
+            getattr(getattr(organization, "context", None), "text", None)
+            if organization is not None else None
+        )
+        l3_facts = (
+            getattr(organization, "selected_facts", ())
+            if organization is not None else ()
+        )
+        self.last_l3_context_text = l3_context
+        l1_facts = ()
+        selection = None
+        if getattr(backend, "last_step", None) == step:
+            with _preserve_rng_state():
+                selection = backend.select(step=step, rgb_width=int(self.rgb_list[-1].shape[1]))
+            l1_facts = selection.selected_facts
+            diagnostic["l1_selection"] = selection.diagnostics
+            diagnostic["l1_fact_records"] = [fact.to_dict() for fact in l1_facts]
+        else:
+            diagnostic["l1_selection_error"] = "L1 observation unavailable at this step"
+
+        def count_tokens_strict(value):
+            count = self._count_tokens(value)
+            if count is None:
+                raise RuntimeError("checkpoint tokenizer did not count prompt tokens")
+            return count
+
+        if type(self.context_len) is not int or self.context_len <= 1024 + 64:
+            raise RuntimeError("checkpoint context limit cannot hold official generation reserve")
+        # The official decoder keeps max_new_tokens=1024.  Reserve 64 tokens
+        # for its conversation/visual markers in addition to the text count.
+        capacity = self.context_len - 1024 - 64
+        fused = compose_sbadir(
+            template=self.promt_template, instruction=instruction,
+            l3_text=l3_context, l3_facts=l3_facts, l1_facts=l1_facts,
+            count_tokens=count_tokens_strict,
+            max_prompt_tokens=capacity,
+            l1_max_tokens=self.l1_max_tokens,
+            entity_links=sidecar.cross_sensor_links,
+        )
+        if fused.diagnostics["omitted_l3_provenance"]:
+            raise RuntimeError("L3 source background did not fit measured prompt capacity")
+        self.last_sbadir_memory_text = fused.memory_text
+        diagnostic.update(fused.diagnostics)
+        diagnostic["context_injected"] = bool(fused.memory_text)
+        diagnostic["prompt_has_l3"] = bool(l3_context)
+        diagnostic["prompt_has_l1"] = bool(fused.l1_text)
+        diagnostic["fact_count"] = len(l3_facts)
+        diagnostic["context_chars"] = len(l3_context or "")
+        # Match A's standalone L3 tokenizer count for A/B reporting.  The
+        # marginal full-prompt delta remains separately logged for budgeting.
+        diagnostic["context_tokens"] = (
+            self._count_tokens(l3_context) if l3_context else 0
+        )
+        diagnostic["l3_original_memory_unchanged"] = bool(
+            fused.diagnostics["l3_core_unchanged"]
+        )
+        diagnostic["source_background_facts"] = (
+            fused.diagnostics["l3_provenance_count"]
+            + fused.diagnostics["l1_retained_facts"]
+        )
+        diagnostic["conflict_type_counts"] = {
+            "object_label": fused.diagnostics["conflicting_facts"]
+        }
+        diagnostic["conflict_evidence_ids"] = [
+            {
+                "l1": entry["l1_evidence_ids"],
+                "l3": entry["l3_evidence_ids"],
+            }
+            for entry in fused.diagnostics["conflicts"]
+        ]
+        if selection is not None:
+            retained_ids = {
+                evidence_id
+                for ids in fused.diagnostics["l1_retained_evidence_ids"]
+                for evidence_id in ids
+            }
+            backend.confirm_local_graph(retained_ids, step=step)
+        return fused.task_text, fused.memory_text, diagnostic
+
+
     @staticmethod
     def _json_default(value):
         item = getattr(value, "item", None)
@@ -454,6 +596,8 @@ class UniNaVid_Agent(Agent):
             row["prompt_text"] = prompt_text
             row["task_text"] = self.last_task_text
             row["l3_context_text"] = self.last_l3_context_text
+            if getattr(self, "l1", None) is not None:
+                row["sbadir_memory_text"] = self.last_sbadir_memory_text
         row.setdefault("l3_enabled", getattr(self, "l3", None) is not None)
         row.setdefault("context_injected", False)
         row.setdefault("prompt_has_l3", False)
@@ -473,6 +617,8 @@ class UniNaVid_Agent(Agent):
         if prompt_tokens is not None:
             self.prompt_token_counts.append(int(prompt_tokens))
         self.step_index += 1
+        if getattr(self, "l1", None) is not None:
+            self.last_action = {"action": action}
 
 
     def episode_summary(self):
@@ -512,7 +658,7 @@ class UniNaVid_Agent(Agent):
         scene_id = None
         if env is not None and getattr(env, "current_episode", None) is not None:
             scene_id = getattr(env.current_episode, "scene_id", None)
-        return {
+        summary = {
             "episode_id": getattr(self, "episode_id", None),
             "scene_id": scene_id,
             "experiment_group": getattr(self, "experiment_group", None),
@@ -546,6 +692,57 @@ class UniNaVid_Agent(Agent):
             "l3_map_summary": map_summary,
             "official_prompt_sha256": getattr(self, "prompt_template_sha256", None),
         }
+        if getattr(self, "l1", None) is not None:
+            prompt_rows = [row for row in rows if row.get("prompt_tokens") is not None]
+            l1_rows = [row for row in rows if row.get("l1_enabled")]
+            aggregate_keys = (
+                "l1_fact_count", "l1_retained_facts", "l1_omitted_facts",
+                "duplicated_facts", "conflicting_facts", "retained_facts",
+                "omitted_facts", "source_background_facts",
+                "uncertain_entity_matches",
+            )
+            totals = {
+                key + "_total": sum(int(row.get(key, 0) or 0) for row in prompt_rows)
+                for key in aggregate_keys
+            }
+            summary.update(totals)
+            summary.update({
+                "l1_fact_count_total": totals["l1_retained_facts_total"],
+                "prompt_has_l1_steps": sum(bool(row.get("prompt_has_l1")) for row in prompt_rows),
+                "l1_observation_attempt_steps": len(l1_rows),
+                "l1_observe_error_count": sum(bool(row.get("l1_observe_error")) for row in l1_rows),
+                "l1_detector_error_count": sum(bool(row.get("l1_detector_error")) for row in l1_rows),
+                "l1_place_attempt_steps": sum(bool(row.get("l1_place_attempted")) for row in l1_rows),
+                "l1_place_observed_steps": sum(bool(row.get("l1_place_observed")) for row in l1_rows),
+                "l1_place_error_count": sum(bool(row.get("l1_place_error")) for row in l1_rows),
+                "l3_segmentation_error_count": sum(bool(row.get("segmentation_error")) for row in l3_rows),
+                "cross_label_entity_links_total": sum(
+                    int(row.get("cross_label_entity_links", 0) or 0) for row in l3_rows
+                ),
+                "cross_label_entity_link_error_count": sum(
+                    bool(row.get("cross_label_entity_link_error")) for row in l3_rows
+                ),
+                "l1_context_tokens_mean": _mean([
+                    row.get("l1_token_count") for row in prompt_rows
+                ]),
+                "l3_context_tokens_mean": _mean([
+                    row.get("context_tokens") for row in prompt_rows
+                    if row.get("prompt_has_l3")
+                ]),
+                "l3_original_memory_unchanged": bool(prompt_rows) and all(
+                    row.get("l3_original_memory_unchanged") is True for row in prompt_rows
+                ),
+                "conflict_type_counts": {
+                    "object_label": sum(int(
+                        (row.get("conflict_type_counts") or {}).get("object_label", 0)
+                    ) for row in prompt_rows),
+                },
+                "conflict_evidence_ids": [
+                    record for row in prompt_rows
+                    for record in row.get("conflict_evidence_ids", [])
+                ],
+            })
+        return summary
 
 
     def close(self):
@@ -557,6 +754,10 @@ class UniNaVid_Agent(Agent):
         if sidecar is not None:
             with _preserve_rng_state():
                 sidecar.close_episode()
+        backend = getattr(self, "l1", None)
+        if backend is not None:
+            with _preserve_rng_state():
+                backend.close_episode()
 
 
     def act(self, observations, info, episode_id):
@@ -566,7 +767,9 @@ class UniNaVid_Agent(Agent):
         self.rgb_list.append(rgb)
         instruction = observations["instruction"]["text"]
         step = self.step_index
+        l1_diagnostic = self._observe_l1(rgb, step)
         l3_diagnostic = self._observe_l3(observations, step)
+        l3_diagnostic.update(l1_diagnostic)
 
         if self.require_map:
             top_down_map = maps.colorize_draw_agent_and_fit_to_height(info["top_down_map_vlnce"], rgb.shape[0])
@@ -586,9 +789,14 @@ class UniNaVid_Agent(Agent):
             return {"action": temp_action}
 
 
-        task_text, l3_context, l3_diagnostic = self._augment_task_text(
-            instruction, step, l3_diagnostic,
-        )
+        if getattr(self, "l1", None) is not None:
+            task_text, l3_context, l3_diagnostic = self._augment_sbadir_task_text(
+                instruction, step, l3_diagnostic,
+            )
+        else:
+            task_text, l3_context, l3_diagnostic = self._augment_task_text(
+                instruction, step, l3_diagnostic,
+            )
         navigation_qs = build_prompt(self.promt_template, task_text)
         verify_task_text_injection(
             self.promt_template, instruction, l3_context, navigation_qs,

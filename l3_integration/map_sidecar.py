@@ -1,10 +1,11 @@
-"""L3-only sidecar: real map update + official-style retrieval for Uni-NaVid.
+"""Episode-local L3 map update + official-style retrieval for Uni-NaVid.
 
 The sidecar owns one ``ObjectMap`` and one L3 evidence store per Episode.  It
 is deliberately not a prompt designer: it calls the vendored LightNav L3
 pipeline (``make_spatial_evidence`` -> ``ObjectMap.observe``) and the vendored
-official-style serializer (``L3OfficialPromptOrganizer``).  It passes an empty
-L1 event list, so no L1 text or L1 fusion can enter the map or the prompt.
+official-style serializer (``L3OfficialPromptOrganizer``).  The baseline
+passes no L1 events.  SBAdir may add verified same-frame L1 evidence links;
+these are provenance only and do not change the mask, map, or fact serializer.
 
 No Habitat import is required here.  The default frame builder is the pure
 ``frame_from_habitat`` adapter; tests inject a synthetic frame builder.
@@ -13,9 +14,13 @@ No Habitat import is required here.  The default frame builder is the pure
 from __future__ import annotations
 
 import logging
+import math
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+
+import numpy as np
 
 from l3_memory.conceptgraphs_lite import ObjectMap
 from l3_memory.l3_official_prompt import L3OfficialPromptOrganizer
@@ -35,6 +40,13 @@ logger = logging.getLogger(__name__)
 FrameBuilder = Callable[
     [Mapping[str, Any], Any, CameraSpec], Tuple[Any, Dict[str, Any]]
 ]
+
+
+class _Py38Description(str):
+    """Supply ``str.removeprefix`` to the frozen LightNav matcher on Python 3.8."""
+
+    def removeprefix(self, prefix):
+        return self[len(prefix):] if self.startswith(prefix) else str(self)
 
 
 
@@ -101,6 +113,7 @@ class L3MapSidecar:
         self.last_context_text: Optional[str] = None
         self._step_observations = 0
         self._segmentation_attempts = 0
+        self.cross_sensor_links: Dict[str, str] = {}
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -157,6 +170,7 @@ class L3MapSidecar:
         self.last_context_text = None
         self._step_observations = 0
         self._segmentation_attempts = 0
+        self.cross_sensor_links = {}
         return {
             "scene_id": self.scene_id,
             "episode_id": self.episode_id,
@@ -182,6 +196,8 @@ class L3MapSidecar:
         step: int,
         *,
         transition_record: bool = False,
+        l1_events: Optional[list[Any]] = None,
+        l1_store: Optional[V3MemoryStore] = None,
     ) -> Dict[str, Any]:
         """Update the L3 map from the current RGB-D observation.
 
@@ -202,6 +218,10 @@ class L3MapSidecar:
             "segmentation_error": None,
             "evidence_minted": 0,
             "evidence_unmatched": 0,
+            "evidence_linked": 0,
+            "evidence_ambiguous": 0,
+            "cross_label_entity_links": 0,
+            "cross_label_entity_link_error": None,
             "observed_objects": 0,
             "object_nodes": 0,
             "viewpoints": 0,
@@ -237,8 +257,35 @@ class L3MapSidecar:
             diagnostic["segmentation_error"] = getattr(
                 self.extractor, "last_error", None,
             )
+            linked_events = []
+            if l1_events and l1_store is not None:
+                from l3_memory.v3_schemas import canonical_evidence_key
+                for event in l1_events:
+                    if (getattr(event, "kind", None) not in
+                            {"object_observation", "landmark"}
+                            or getattr(event, "step_id", None) != step):
+                        continue
+                    key = canonical_evidence_key(
+                        self.scene_id, self.episode_id, 0, event.event_id,
+                    )
+                    record = l1_store.get_evidence(key)
+                    if (record is None or record.scene_id != self.scene_id
+                            or record.episode_id != self.episode_id
+                            or record.step != step
+                            or record.observation_status != "observed"
+                            or not record.provenance_validity):
+                        continue
+                    if self.store.get_evidence(key) is None:
+                        self.store.add(record)
+                    linked_events.append(SimpleNamespace(
+                        kind=event.kind,
+                        description=_Py38Description(event.description),
+                        metadata=event.metadata,
+                        event_id=event.event_id,
+                        step_id=event.step_id,
+                    ))
             masks, counts = make_spatial_evidence(
-                instances, [], self.store,
+                instances, linked_events, self.store,
                 scene_id=self.scene_id,
                 episode_id=self.episode_id,
                 rollout_idx=0,
@@ -248,13 +295,22 @@ class L3MapSidecar:
                 ambiguity_margin=self.config.evidence_ambiguity_margin,
             )
             diagnostic["evidence_minted"] = counts["minted"]
-            # No L1 events are supplied, so every minted mask is "unmatched".
-            # This is the explicit L1-off state, not a detection failure.
             diagnostic["evidence_unmatched"] = counts["unmatched"]
+            diagnostic["evidence_linked"] = counts["linked"]
+            diagnostic["evidence_ambiguous"] = counts["ambiguous"]
             observed = self.object_map.observe(
                 frame, masks, step_id=step,
                 transition_record=bool(transition_record),
             )
+            if linked_events:
+                try:
+                    diagnostic["cross_label_entity_links"] = self._link_cross_label_boxes(
+                        instances, linked_events,
+                    )
+                except Exception as exc:
+                    diagnostic["cross_label_entity_link_error"] = (
+                        "%s: %s" % (type(exc).__name__, exc)
+                    )
             diagnostic["observed_objects"] = len(observed)
             diagnostic["object_nodes"] = len(self.object_map.objects)
             diagnostic["viewpoints"] = len(self.object_map.viewpoints)
@@ -276,6 +332,78 @@ class L3MapSidecar:
         diagnostic["observe_ms"] = (time.perf_counter() - started) * 1000.0
         self.last_observation_diagnostic = diagnostic
         return diagnostic
+
+    def _link_cross_label_boxes(self, instances, l1_events):
+        """Link only unique same-frame boxes with strong mask overlap.
+
+        This auxiliary identity proof is used for conflict recording.  It does
+        not alter the L3 map, its evidence records, or its official serializer.
+        A class disagreement is never resolved here.
+        """
+        from l3_memory.v3_schemas import canonical_evidence_key
+
+        node_by_evidence = {
+            edge.evidence_id: edge.object_id
+            for edge in self.object_map.edges
+            if edge.relation_type == "observed_from"
+        }
+        proposals = []
+        for index, instance in enumerate(instances):
+            l3_id = canonical_evidence_key(
+                self.scene_id, self.episode_id, 0,
+                "l3_seg_%d_%d" % (self.last_frame_step, index),
+            )
+            record = self.object_map.evidence.get(l3_id)
+            if (record is None or record.geometry_status != "observed"
+                    or l3_id not in node_by_evidence):
+                continue
+            mask = np.asarray(instance.mask)
+            if mask.ndim != 2 or mask.dtype != np.bool_ or not mask.any():
+                continue
+            sx1, sy1, sx2, sy2 = (float(value) for value in instance.bbox_xyxy)
+            if not all(math.isfinite(value) for value in (sx1, sy1, sx2, sy2)):
+                continue
+            for event in l1_events:
+                l1_label = str(event.description)
+                if l1_label.startswith("Observed "):
+                    l1_label = l1_label[len("Observed "):]
+                cross_label = l1_label.strip().casefold() != instance.class_name.casefold()
+                box = event.metadata.get("bbox_xyxy")
+                if not isinstance(box, (list, tuple)) or len(box) != 4:
+                    continue
+                try:
+                    x1, y1, x2, y2 = (float(value) for value in box)
+                except (TypeError, ValueError):
+                    continue
+                if (not all(math.isfinite(value) for value in (x1, y1, x2, y2))
+                        or x1 < 0 or y1 < 0 or x2 > mask.shape[1]
+                        or y2 > mask.shape[0] or x2 <= x1 or y2 <= y1):
+                    continue
+                overlap = max(0.0, min(sx2, x2) - max(sx1, x1)) * max(
+                    0.0, min(sy2, y2) - max(sy1, y1)
+                )
+                union = (sx2 - sx1) * (sy2 - sy1) + (x2 - x1) * (y2 - y1) - overlap
+                if union <= 0 or overlap / union < 0.7:
+                    continue
+                xlo, xhi = max(0, int(math.floor(x1))), min(mask.shape[1], int(math.ceil(x2)))
+                ylo, yhi = max(0, int(math.floor(y1))), min(mask.shape[0], int(math.ceil(y2)))
+                if float(mask[ylo:yhi, xlo:xhi].sum()) / float(mask.sum()) < 0.8:
+                    continue
+                l1_id = canonical_evidence_key(
+                    self.scene_id, self.episode_id, 0, event.event_id,
+                )
+                proposals.append((l1_id, l3_id, node_by_evidence[l3_id], cross_label))
+        by_l1 = {}
+        by_l3 = {}
+        for l1_id, l3_id, _node, _cross_label in proposals:
+            by_l1[l1_id] = by_l1.get(l1_id, 0) + 1
+            by_l3[l3_id] = by_l3.get(l3_id, 0) + 1
+        added = 0
+        for l1_id, l3_id, node_id, cross_label in proposals:
+            if cross_label and by_l1[l1_id] == 1 and by_l3[l3_id] == 1:
+                self.cross_sensor_links[l1_id] = node_id
+                added += 1
+        return added
 
     # -- prompt context -------------------------------------------------------
 
