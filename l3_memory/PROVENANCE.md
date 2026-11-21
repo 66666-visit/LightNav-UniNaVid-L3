@@ -34,12 +34,23 @@ lightnav.memory.v3_retrieval._terms            -> l3_memory.lexical._terms
 the upstream modules. They were extracted so this package does not import the
 L1 fusion module or the full V3 retrieval module. No logic was changed.
 
+## Python 3.8 compatibility helper
+
+`l3_memory/compat.py` is **not** vendored algorithm code. It is a new,
+project-local helper added for the Python 3.8 VLN-CE environment. It provides
+`removeprefix`, the Python 3.9+ `str.removeprefix` operation used by
+`spatial_graph_adapter.py`. It is standalone so an L3-only run does not import
+`l1_memory.compat` or any L1 prompt module.
+
+`provenance.json` records it under `compatibility_helpers`, separately from the
+vendored algorithm files in `files`.
+
 ## Source hashes
 
-`provenance.json` records the source and vendored SHA-256 for every file. The
-tests recompute the vendored hashes and fail if a file drifts. The source hashes
-are evidence of what was copied; the source repository is read-only for this
-task.
+`provenance.json` records the source and vendored SHA-256 for every vendored
+algorithm file, and the SHA-256 of the local compatibility helper. The tests
+recompute the vendored hashes and fail if a file drifts. The source hashes are
+evidence of what was copied; the source repository is read-only for this task.
 
 ## What was deliberately not copied
 

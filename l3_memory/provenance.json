@@ -4,6 +4,18 @@
   "source_commit": "6aefffa",
   "source_commit_subject": "feat: add L3 official-style navigation prompt",
   "vendored_on": "2026-11-18",
+  "compatibility_helpers": [
+    {
+      "name": "compat.py",
+      "path": "l3_memory/compat.py",
+      "kind": "project_local_python38_helper",
+      "added_on": "2026-11-21",
+      "source": null,
+      "origin": "new file in LightNav-UniNaVid-L3; not copied from LightNav-0-codex",
+      "purpose": "Python 3.8 replacement for str.removeprefix used by spatial_graph_adapter.py",
+      "sha256": "3bd8e50901a867cb111d60125272f0a07e4fef13d307e180b9540e6e3be2b278"
+    }
+  ],
   "files": [
     {
       "name": "conceptgraphs_lite.py",
