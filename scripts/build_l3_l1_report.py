@@ -63,10 +63,19 @@ REQUIRED_C_FIELDS = (
     "conflicting_facts_total", "retained_facts_total", "omitted_facts_total",
     "prompt_has_l1_steps", "l3_original_memory_unchanged",
     "source_background_facts_total", "l3_provenance_count_total",
-    "l1_retained_facts_total", "l1_observation_attempt_steps",
-    "l1_enabled_steps", "l1_observe_error_count", "l1_detector_error_count",
+    "l1_retained_facts_total", "l1_omitted_facts_total",
+    "l1_prompt_built_steps", "l1_empty_steps",
+    "l1_observation_attempt_steps", "l1_events_persisted_total",
+    "l1_detection_events_persisted_total",
+    "l1_enabled_steps", "l1_observe_error_count", "l1_selection_error_count",
+    "l1_detector_error_count",
     "l1_place_attempt_steps", "l1_place_observed_steps", "l1_place_error_count",
     "l3_segmentation_error_count", "cross_label_entity_link_error_count",
+    "l1_token_budget_steps", "l1_token_budget_fallback_steps",
+    "token_overflow_drops_total", "memory_budget_violation_steps",
+    "text_prompt_tokens_mean", "visual_tokens_mean",
+    "multimodal_prompt_tokens_mean", "context_margin_tokens_min",
+    "multimodal_budget_violation_steps",
 )
 METRICS = (
     ("SR", "success", 100.0, "%", "higher"),
@@ -87,12 +96,17 @@ COUNT_FIELDS = (
     "l3_fact_count_total", "l1_fact_count_total", "duplicated_facts_total",
     "conflicting_facts_total", "retained_facts_total", "omitted_facts_total",
     "prompt_has_l3_steps", "prompt_has_l1_steps", "source_background_facts_total",
-    "l3_provenance_count_total", "l1_retained_facts_total", "l1_enabled_steps",
-    "l1_observation_attempt_steps", "l1_observe_error_count",
-    "l1_detector_error_count", "l1_place_attempt_steps",
+    "l3_provenance_count_total", "l1_retained_facts_total",
+    "l1_omitted_facts_total", "l1_prompt_built_steps", "l1_empty_steps",
+    "l1_events_persisted_total", "l1_detection_events_persisted_total",
+    "l1_enabled_steps", "l1_observation_attempt_steps", "l1_observe_error_count",
+    "l1_selection_error_count", "l1_detector_error_count", "l1_place_attempt_steps",
     "l1_place_observed_steps", "l1_place_error_count",
     "l3_segmentation_error_count", "cross_label_entity_link_error_count",
     "cross_label_entity_links_total", "env_steps",
+    "l1_token_budget_steps", "l1_token_budget_fallback_steps",
+    "token_overflow_drops_total", "memory_budget_violation_steps",
+    "context_margin_tokens_min", "multimodal_budget_violation_steps",
 )
 
 
@@ -308,10 +322,40 @@ def _validate_configs(
     for key in ("det_model", "place_model"):
         if not l1_block.get(key):
             raise ValueError("C L1 configuration lacks {}".format(key))
-    for key in ("det_confidence", "every_n_steps", "max_items", "max_tokens"):
+    for key in ("det_confidence", "every_n_steps", "max_items",
+                "prompt_max_chars", "builder"):
         if key not in l1_block:
             raise ValueError("C L1 configuration lacks {}".format(key))
-    if l1_block.get("fusion") != "source_background_augmentation_direct":
+    if l1_block.get("builder") != "local_graph_fusion":
+        raise ValueError("C L1 is not the original LocalGraphFusion builder")
+    if l1_block.get("prompt_max_chars") != 320:
+        raise ValueError("C L1 does not keep the original 320-character fallback")
+    if l1_block.get("max_items") != 2:
+        raise ValueError("C L1 does not use the original two-landmark card")
+    budget = l1_block.get("budget")
+    if not isinstance(budget, dict):
+        raise ValueError("C L1 configuration lacks the token-budget protocol")
+    if budget.get("strategy") != "token_aware_context":
+        raise ValueError("C L1 does not use the token-aware prompt budget")
+    if budget.get("token_aware") is not True:
+        raise ValueError("C L1 token budget is not enabled")
+    if budget.get("original_char_budget_chars") != 320:
+        raise ValueError("C L1 original-character fallback differs")
+    if budget.get("generation_reserve") != "max_new_tokens":
+        raise ValueError("C L1 reserves a value other than max_new_tokens")
+    if budget.get("safety_margin_tokens") != 1:
+        raise ValueError("C L1 safety margin is not the original one token")
+    if budget.get("whole_lines_only") is not True:
+        raise ValueError("C L1 token budget may cut a line")
+    if budget.get("visual_token_accounting") != (
+        "online_merge_upper_bound_from_actual_cache"
+    ):
+        raise ValueError("C L1 budget does not account for visual tokens")
+    if budget.get("max_landmarks") != l1_block.get("max_items"):
+        raise ValueError("C L1 budget landmark count differs")
+    if budget.get("fallback") != "original_char_budget_with_reported_reason":
+        raise ValueError("C L1 fallback protocol differs")
+    if l1_block.get("fusion") != "original_l1_plus_l3_sbadir":
         raise ValueError("C L1 fusion mode differs")
 
     # No L1 weight path may appear anywhere in A's or B's run configuration.
@@ -431,23 +475,61 @@ def _validate_rows(
         for field in REQUIRED_C_FIELDS:
             if field not in rc:
                 raise ValueError("C result lacks required diagnostic {} at {}".format(field, key))
+        token_steps_c = _int_nonnegative(rc, "l1_token_budget_steps")
         for field in REQUIRED_C_FIELDS:
             if field in ("l3_context_tokens_mean", "l1_context_tokens_mean",
+                         "text_prompt_tokens_mean", "visual_tokens_mean",
+                         "multimodal_prompt_tokens_mean",
                          "l3_original_memory_unchanged"):
+                continue
+            if field == "context_margin_tokens_min" and token_steps_c == 0:
                 continue
             _int_nonnegative(rc, field)
         if rc["l3_original_memory_unchanged"] is not True:
             raise ValueError("C altered original L3 memory at {}".format(key))
         c_l3 = _int_nonnegative(rc, "l3_fact_count_total")
         c_l1 = _int_nonnegative(rc, "l1_fact_count_total")
-        if c_l1 != _int_nonnegative(rc, "l1_retained_facts_total"):
-            raise ValueError("C L1 retained-fact count differs at {}".format(key))
-        if _int_nonnegative(rc, "source_background_facts_total") != c_l3 + c_l1:
-            raise ValueError("C did not source-pair every retained fact at {}".format(key))
+        c_l1_retained = _int_nonnegative(rc, "l1_retained_facts_total")
+        c_l1_built = _int_nonnegative(rc, "l1_prompt_built_steps")
+        c_l1_prompt = _int_nonnegative(rc, "prompt_has_l1_steps")
+        if c_l1_retained > c_l1:
+            raise ValueError("C retained more L1 facts than selected at {}".format(key))
+        if c_l1 == 0:
+            if c_l1_retained or c_l1_built or c_l1_prompt:
+                raise ValueError("C has an L1 card without an L1 fact at {}".format(key))
+        else:
+            if c_l1_built <= 0:
+                raise ValueError("C built no original L1 card at {}".format(key))
+            if c_l1_retained <= 0:
+                raise ValueError("C did not inject a selected L1 fact at {}".format(key))
+            if c_l1_prompt <= 0:
+                raise ValueError("C prompt lacks the L1 card at {}".format(key))
+        # C's SBAdir source background covers B's frozen L3 facts only.  The
+        # original Local Graph L1 card is inserted verbatim without a suffix.
+        if _int_nonnegative(rc, "source_background_facts_total") != c_l3:
+            raise ValueError("C did not source-pair every L3 fact at {}".format(key))
         if _int_nonnegative(rc, "l3_provenance_count_total") != c_l3:
             raise ValueError("C L3 source-background count differs at {}".format(key))
         if _int_nonnegative(rc, "l1_enabled_steps") != _int_nonnegative(rc, "env_steps"):
             raise ValueError("C did not observe through L1 on every step at {}".format(key))
+        token_steps = _int_nonnegative(rc, "l1_token_budget_steps")
+        fallback_steps = _int_nonnegative(rc, "l1_token_budget_fallback_steps")
+        if token_steps + fallback_steps > _int_nonnegative(rc, "env_steps"):
+            raise ValueError("C token-budget step counts exceed env_steps at {}".format(key))
+        if _int_nonnegative(rc, "token_overflow_drops_total") < 0:
+            raise ValueError("C token overflow count is negative at {}".format(key))
+        if _int_nonnegative(rc, "memory_budget_violation_steps") != 0:
+            raise ValueError("C injected more L1 tokens than the budget at {}".format(key))
+        if _int_nonnegative(rc, "multimodal_budget_violation_steps") != 0:
+            raise ValueError("C multimodal prompt exceeded context reserve at {}".format(key))
+        if _int_nonnegative(rc, "context_margin_tokens_min") < 0:
+            raise ValueError("C multimodal context margin is negative at {}".format(key))
+        if token_steps_c > 0:
+            for field in ("text_prompt_tokens_mean", "visual_tokens_mean",
+                          "multimodal_prompt_tokens_mean"):
+                value = rc.get(field)
+                if not isinstance(value, (int, float)) or value < 0:
+                    raise ValueError("C lacks a valid {} at {}".format(field, key))
         triples.append((ra, rb, rc))
     return triples
 
@@ -492,6 +574,7 @@ def _step_audit(path: Path) -> Dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(str(path))
     observed = 0
+    observed_l1 = 0
     with path.open(encoding="utf-8") as stream:
         for number, line in enumerate(stream, 1):
             if not line.strip():
@@ -517,7 +600,69 @@ def _step_audit(path: Path) -> Dict[str, Any]:
                         raise ValueError("original L3 line missing or duplicated at step {}".format(number))
                     search_from = matches[0] + 1
                 observed += 1
-    return {"l3_prompt_steps_checked": observed, "original_l3_line_prefixes_preserved": True}
+            if row.get("prompt_has_l1"):
+                l1 = row.get("l1_context_text")
+                prompt = row.get("prompt_text")
+                if not isinstance(l1, str) or not l1.startswith("[Navigation Memory]\n"):
+                    raise ValueError("L1 prompt step lacks the original header at step {}".format(number))
+                budget_source = row.get("budget_source") or (
+                    row.get("l1_selection") or {}
+                ).get("budget_source")
+                if budget_source == "token_aware_context":
+                    available = row.get("available_memory_tokens")
+                    injected = row.get("memory_tokens_injected")
+                    if (
+                        isinstance(available, int) and isinstance(injected, int)
+                        and injected > available
+                    ):
+                        raise ValueError(
+                            "L1 memory tokens exceed the measured budget at step {}".format(number)
+                        )
+                    text_tokens = row.get("text_prompt_tokens")
+                    visual_tokens = row.get("visual_tokens")
+                    base_tokens = row.get("base_prompt_tokens")
+                    if all(isinstance(value, int) for value in (
+                        text_tokens, visual_tokens, base_tokens,
+                    )) and base_tokens != text_tokens + visual_tokens:
+                        raise ValueError(
+                            "multimodal base token accounting differs at step {}".format(number)
+                        )
+                    limit = row.get("multimodal_prompt_limit_tokens")
+                    final = row.get("multimodal_prompt_tokens")
+                    if isinstance(limit, int) and isinstance(final, int):
+                        if final > limit:
+                            raise ValueError(
+                                "multimodal prompt exceeds context reserve at step {}".format(number)
+                            )
+                        margin = row.get("context_margin_tokens")
+                        if isinstance(margin, int) and margin != limit - final:
+                            raise ValueError(
+                                "multimodal context margin differs at step {}".format(number)
+                            )
+                    if row.get("multimodal_budget_overflow") is True:
+                        raise ValueError(
+                            "multimodal budget overflow flag set at step {}".format(number)
+                        )
+                elif len(l1) > 320:
+                    raise ValueError(
+                        "L1 fallback card exceeds the original 320-character budget at step {}".format(number)
+                    )
+                if not isinstance(prompt, str) or l1 not in prompt:
+                    raise ValueError("original L1 card is not verbatim in the prompt at step {}".format(number))
+                if row.get("l1_prompt_chars") != len(l1):
+                    raise ValueError("L1 card length differs at step {}".format(number))
+                expected_sha = hashlib.sha256(l1.encode("utf-8")).hexdigest()
+                if row.get("l1_prompt_sha256") != expected_sha:
+                    raise ValueError("original L1 digest differs at step {}".format(number))
+                if row.get("l1_budget_chars") != 320:
+                    raise ValueError("L1 budget differs at step {}".format(number))
+                observed_l1 += 1
+    return {
+        "l3_prompt_steps_checked": observed,
+        "original_l3_line_prefixes_preserved": True,
+        "l1_prompt_steps_checked": observed_l1,
+        "original_l1_cards_verbatim": True,
+    }
 
 
 def _ordered_result_rows(path: Path) -> List[Dict[str, Any]]:
@@ -737,21 +882,36 @@ def _smoke_audit(output_dir: Path, launch: Dict[str, Any]) -> Optional[Dict[str,
         raise ValueError("C smoke did not enable L1")
     if c.get("l1_enabled_steps") != c.get("env_steps"):
         raise ValueError("C smoke did not run L1 on every step")
-    if c.get("l1_fact_count_total", 0) <= 0:
-        raise ValueError("C smoke produced no L1 fact")
-    if c.get("source_background_facts_total") != (
-            c.get("l3_fact_count_total", 0) + c.get("l1_fact_count_total", 0)):
-        raise ValueError("C smoke did not pair every retained fact with its source")
+    # The original LocalGraphFusion card may legitimately be empty for one
+    # Episode.  Only require prompt facts when the L1 builder produced them.
+    l1_facts = int(c.get("l1_fact_count_total", 0) or 0)
+    l1_retained = int(c.get("l1_retained_facts_total", 0) or 0)
+    l1_built = int(c.get("l1_prompt_built_steps", 0) or 0)
+    l1_prompt_steps = int(c.get("prompt_has_l1_steps", 0) or 0)
+    if l1_facts == 0:
+        if l1_retained or l1_built or l1_prompt_steps:
+            raise ValueError("C smoke built/injected an L1 card without an L1 fact")
+    else:
+        if l1_built <= 0:
+            raise ValueError("C smoke produced L1 facts but never built the original L1 card")
+        if l1_retained <= 0:
+            raise ValueError("C smoke selected L1 facts but did not inject them verbatim")
+        if l1_prompt_steps <= 0:
+            raise ValueError("C smoke selected L1 facts but no prompt step contains the L1 card")
+    # SBAdir pairs B's frozen L3 facts; the original L1 card is verbatim.
+    if c.get("source_background_facts_total") != c.get("l3_fact_count_total", 0):
+        raise ValueError("C smoke did not pair every L3 fact with its source")
     if c.get("l3_original_memory_unchanged") is not True:
         raise ValueError("C smoke altered original L3 memory")
-    for key in ("l1_observe_error_count", "l1_detector_error_count",
+    for key in ("l1_observe_error_count", "l1_selection_error_count",
+                "l1_detector_error_count",
                 "l1_place_error_count", "l3_segmentation_error_count",
                 "cross_label_entity_link_error_count"):
         if c.get(key, 0) != 0:
             raise ValueError("C smoke encountered {}".format(key))
     for key in ("l3_map_steps", "l3_fact_count_total", "prompt_has_l3_steps",
-                "prompt_has_l1_steps", "l1_place_attempt_steps",
-                "l1_place_observed_steps"):
+                "l1_place_attempt_steps", "l1_place_observed_steps",
+                "l1_events_persisted_total"):
         if c.get(key, 0) <= 0:
             raise ValueError("C smoke did not exercise {}".format(key))
     return {
@@ -1161,12 +1321,12 @@ def build_report(
     )
     c_adds_l1 = (
         c_metrics["l1_fact_count_total"] > 0
+        and c_metrics["l1_prompt_built_steps"] > 0
         and c_metrics["prompt_has_l1_steps"] > 0
         and b_metrics["l1_fact_count_total"] == 0
     )
     c_keeps_b = all(
-        row.get("source_background_facts_total")
-        == row.get("l3_fact_count_total", 0) + row.get("l1_fact_count_total", 0)
+        row.get("source_background_facts_total") == row.get("l3_fact_count_total", 0)
         and row.get("l3_original_memory_unchanged") is True
         for row in c_list
     )

@@ -1,9 +1,20 @@
-"""Run the LightNav L1 writer on Uni-NaVid RGB observations.
+"""Run LightNav's original ``LocalGraphFusion`` L1 path on Uni-NaVid RGB.
 
-The writer, V3 store, DINOv2 place history, LocalGraphFusion and
-L1PromptOrganizer remain the LightNav algorithms. This adapter only supplies
-the observation and exposes selected facts with their actual source records.
-It never creates a second navigation prompt or a sensor trust score.
+This module is an adapter, not an L1 algorithm.  It supplies Uni-NaVid's RGB
+observation to the vendored LightNav ``MemoryWriter``, the original place
+observation method (``MemoryManager._observe_place_v3``), the original V3
+evidence persistence method (``MemoryManager._persist_v3_events``), and the
+original ``LocalGraphFusion`` card.  There is no L1 prompt organizer, no
+second fact-selection rule, and no SBAdir rewrite of the L1 lines here.  The
+only additional step is LightNav's token-budget whole-line selector over the
+frozen card; it can omit trailing original lines but cannot create or rewrite
+a fact.
+
+The only code that is not a literal copy from LightNav is the interface:
+``observe`` accepts a Uni-NaVid RGB array and a step number, ``select`` returns
+the original ``MemoryContext`` plus the exact text that the original context
+builder produced, and ``reset_episode`` accepts the Episode identities already
+known by the Uni-NaVid runner.
 """
 
 from __future__ import annotations
@@ -11,168 +22,79 @@ from __future__ import annotations
 import logging
 import re
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
+from l1_integration.token_budget import (
+    ORIGINAL_CHAR_FALLBACK,
+    UNBOUNDED_CHAR_LIMIT,
+    MemoryTokenBudget,
+    TokenBudgetFailure,
+    select_context_lines,
+)
+from l1_memory.compat import removeprefix
 from l1_memory.episodic_memory import EpisodicMemory
-from l1_memory.l1_prompt_organizer import L1Fact, L1PromptOrganizer
 from l1_memory.local_graph_config import LocalGraphConfig
 from l1_memory.local_graph_fusion import LocalGraphFusion
+from l1_memory.memory_context_builder import build_context_text
 from l1_memory.memory_writer import MemoryWriter
 from l1_memory.scene_graph import SceneGraph
 from l1_memory.working_memory import WorkingMemoryStore
-from l3_memory.schemas import LayerMemoryItem, MemoryEvent, ObservationPacket
+from l3_memory.schemas import LayerMemoryItem, MemoryContext, MemoryEvent, ObservationPacket
 from l3_memory.v3_schemas import EvidenceRecord
 from l3_memory.v3_store import V3MemoryStore
 
 logger = logging.getLogger(__name__)
+
+#: Exact values of the 75% Local Graph baseline (LightNav tag
+#: ``baseline-local-graph-fusion-88-sr75``, commit ``2fb184e``).
+ORIGINAL_L1_PROMPT_MAX_CHARS = 320
+ORIGINAL_L1_MAX_LANDMARKS = 2
+ORIGINAL_L1_REACTIVATION_STEPS = 8
+ORIGINAL_L1_PLACE_EVERY_N_STEPS = 5
+ORIGINAL_L1_SCOPE = "episode_local"
+
 _DETECTION_KINDS = frozenset({"object_observation", "landmark"})
-
-
-@dataclass(frozen=True)
-class L1SourceEvidence:
-    """One real RGB detection and its record-level provenance."""
-
-    evidence_id: str
-    observation_step: int
-    object_label: str | None
-    detection_confidence: float | None
-    detector_name: str | None
-    rgb_observation_source: str | None
-    bbox_xyxy: tuple[float, float, float, float] | None
-    source_evidence_ids: tuple[str, ...]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "evidence_id": self.evidence_id,
-            "observation_step": self.observation_step,
-            "object_label": self.object_label,
-            "detection_confidence": self.detection_confidence,
-            "detector_name": self.detector_name,
-            "rgb_observation_source": self.rgb_observation_source,
-            "bbox_xyxy": list(self.bbox_xyxy) if self.bbox_xyxy is not None else None,
-            "source_evidence_ids": list(self.source_evidence_ids),
-        }
-
-
-@dataclass(frozen=True)
-class L1SelectedFact:
-    """A LightNav-selected fact; detector labels are not physical identities."""
-
-    text: str
-    label: str
-    role: str
-    sector: str | None
-    first_step: int
-    last_step: int
-    sightings: int
-    evidence_ids: tuple[str, ...]
-    evidence: tuple[L1SourceEvidence, ...]
-    selection_source: str
-    entity_id: str | None = None
-    attribute: str = "object_label"
-    visual_place_id: str | None = None
-    visual_place_evidence_ids: tuple[str, ...] = ()
-    visual_place_source: str | None = None
-
-    @property
-    def value(self) -> str:
-        return self.label
-
-    @property
-    def source(self) -> str | None:
-        """Detector reported for the selected source record, if present."""
-        return self.evidence[0].detector_name if self.evidence else None
-
-    @property
-    def rgb_observation_source(self) -> str | None:
-        return self.evidence[0].rgb_observation_source if self.evidence else None
-
-    @property
-    def confidence(self) -> float | None:
-        """An actual recorded detector score, never a source trust score."""
-        scores = [
-            entry.detection_confidence for entry in self.evidence
-            if entry.detection_confidence is not None
-        ]
-        if not scores:
-            return None
-        return scores[0] if self.role == "current" else max(scores)
-
-    def line(self) -> str:
-        return self.text
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "text": self.text,
-            "label": self.label,
-            "role": self.role,
-            "sector": self.sector,
-            "first_step": self.first_step,
-            "last_step": self.last_step,
-            "sightings": self.sightings,
-            "evidence_ids": list(self.evidence_ids),
-            "evidence": [entry.to_dict() for entry in self.evidence],
-            "selection_source": self.selection_source,
-            "entity_id": self.entity_id,
-            "attribute": self.attribute,
-            "value": self.value,
-            "source": self.source,
-            "confidence": self.confidence,
-            "rgb_observation_source": self.rgb_observation_source,
-            "visual_place_id": self.visual_place_id,
-            "visual_place_evidence_ids": list(self.visual_place_evidence_ids),
-            "visual_place_source": self.visual_place_source,
-        }
+_DETECTION_WORDS = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(frozen=True)
 class L1Selection:
-    organized_facts: tuple[L1SelectedFact, ...]
-    local_graph_facts: tuple[L1SelectedFact, ...]
+    """The original Local Graph card and the exact text for the prompt.
+
+    ``context`` is the ``LocalGraphFusion.build`` result after the optional
+    whole-line token selection; every line is an unchanged original line.
+    ``prompt_text`` is what LightNav's context builder injects: HTML-escaped
+    and bounded by the measured token budget, or by the original 320-character
+    module budget on the fallback path.
+    """
+
+    context: MemoryContext | None
+    prompt_text: str | None
+    evidence_ids: tuple[str, ...]
     diagnostics: dict[str, Any]
 
     @property
-    def selected_facts(self) -> tuple[L1SelectedFact, ...]:
-        """Keep organizer order and merge distinct graph-place context."""
-        merged = list(self.organized_facts)
-        used = {key for fact in merged for key in fact.evidence_ids}
-        for fact in self.local_graph_facts:
-            if set(fact.evidence_ids).issubset(used):
-                if fact.role == "history" and fact.visual_place_id is not None:
-                    for index, existing in enumerate(merged):
-                        if (existing.label.casefold() == fact.label.casefold()
-                                and set(fact.evidence_ids).issubset(set(existing.evidence_ids))):
-                            qualifier = (
-                                " Visual place history: near a visually similar area "
-                                "(possible revisit; current direction and passage unknown)."
-                            )
-                            merged[index] = replace(
-                                existing,
-                                text=existing.text + qualifier,
-                                selection_source="l1_prompt_organizer+local_graph_fusion",
-                                visual_place_id=fact.visual_place_id,
-                                visual_place_evidence_ids=fact.visual_place_evidence_ids,
-                                visual_place_source=fact.visual_place_source,
-                            )
-                            break
-                continue
-            merged.append(fact)
-            used.update(fact.evidence_ids)
-        return tuple(merged)
+    def fact_count(self) -> int:
+        return len(self.context.layer_items) if self.context is not None else 0
+
+    @property
+    def text(self) -> str:
+        return self.prompt_text or ""
 
 
 class L1EvidenceBackend:
-    """Episode-local RGB L1 memory with provenance-preserving fact selection."""
+    """Episode-local RGB L1 memory using only LightNav's original algorithms."""
 
     def __init__(
         self,
         detector: Any,
         *,
         place_extractor: Any | None = None,
-        max_landmarks: int = 2,
-        place_every_n_steps: int = 5,
+        max_landmarks: int = ORIGINAL_L1_MAX_LANDMARKS,
+        place_every_n_steps: int = ORIGINAL_L1_PLACE_EVERY_N_STEPS,
     ) -> None:
         if detector is None:
             raise ValueError("L1 requires a real RGB detector")
@@ -183,10 +105,16 @@ class L1EvidenceBackend:
         self.detector = detector
         self.place_extractor = place_extractor
         self.place_every_n_steps = place_every_n_steps
-        self.organizer = L1PromptOrganizer(max_items=max_landmarks)
+        self.max_landmarks = max_landmarks
+        # This is the exact LocalGraphConfig of the 75% baseline.  The
+        # character ceiling is not lifted and no token-derived replacement is
+        # used for L1.
         self.local_graph = LocalGraphFusion(LocalGraphConfig(
-            enabled=True, scope="episode_local", prompt_max_chars=65536,
+            enabled=True,
+            scope=ORIGINAL_L1_SCOPE,
+            prompt_max_chars=ORIGINAL_L1_PROMPT_MAX_CHARS,
             max_landmarks=max_landmarks,
+            reactivation_steps=ORIGINAL_L1_REACTIVATION_STEPS,
         ))
         self.working = WorkingMemoryStore()
         self.episodic = EpisodicMemory()
@@ -198,18 +126,27 @@ class L1EvidenceBackend:
         self.instruction = ""
         self.rollout_idx = 0
         self.place_id: str | None = None
+        self.v3_descriptor: tuple[float, ...] | None = None
         self._prior_place_id: str | None = None
         self._pending_descriptors: dict[str, tuple[float, ...]] = {}
         self.last_events: list[MemoryEvent] = []
         self.last_step: int | None = None
         self.last_diagnostic: dict[str, Any] = {}
+        self.last_v3_diagnostic: dict[str, Any] = {}
         self.last_place_error: str | None = None
         self.last_place_observed = False
-        self._local_graph_selected_ids: frozenset[str] = frozenset()
+        self.last_place_attempted = False
+        self._selected_ids: frozenset[str] = frozenset()
+
+    # -- lifecycle -----------------------------------------------------------
 
     def reset_episode(
-        self, scene_id: str, episode_id: str, instruction: str,
-        *, rollout_idx: int = 0,
+        self,
+        scene_id: str,
+        episode_id: str,
+        instruction: str,
+        *,
+        rollout_idx: int = 0,
     ) -> None:
         if not scene_id or not episode_id:
             raise ValueError("scene_id and episode_id are required")
@@ -222,7 +159,7 @@ class L1EvidenceBackend:
         self.episode_id = episode_id
         self.instruction = instruction
         self.rollout_idx = rollout_idx
-        self.v3_store = V3MemoryStore(scope="episode_local")
+        self.v3_store = V3MemoryStore(scope=ORIGINAL_L1_SCOPE)
         self.v3_store.begin_episode(scene_id, episode_id, instruction, rollout_idx)
         self.working.reset(episode_id, instruction)
         self.episodic = EpisodicMemory()
@@ -235,14 +172,17 @@ class L1EvidenceBackend:
         )
         self.local_graph.reset_episode(scene_id, episode_id, rollout_idx)
         self.place_id = None
+        self.v3_descriptor = None
         self._prior_place_id = None
         self._pending_descriptors.clear()
         self.last_events = []
         self.last_step = None
         self.last_diagnostic = {}
+        self.last_v3_diagnostic = {}
         self.last_place_error = None
         self.last_place_observed = False
-        self._local_graph_selected_ids = frozenset()
+        self.last_place_attempted = False
+        self._selected_ids = frozenset()
 
     def close_episode(self) -> None:
         self.local_graph.close_episode()
@@ -261,7 +201,10 @@ class L1EvidenceBackend:
         self.last_step = None
         self.last_place_error = None
         self.last_place_observed = False
-        self._local_graph_selected_ids = frozenset()
+        self.last_place_attempted = False
+        self._selected_ids = frozenset()
+
+    # -- observation ---------------------------------------------------------
 
     def observe(
         self,
@@ -272,6 +215,12 @@ class L1EvidenceBackend:
         last_action: dict[str, Any] | None = None,
         prediction: str | None = None,
     ) -> tuple[list[MemoryEvent], dict[str, Any]]:
+        """Consume one RGB observation through the original L1 write path.
+
+        ``rgb_observation_source`` is accepted for runner diagnostics only.  It
+        is deliberately not injected into the L1 record payload, matching the
+        75% baseline's ``_persist_v3_events``.
+        """
         if self.writer is None or self.v3_store is None or self.scene_id is None:
             raise RuntimeError("L1 episode is not active")
         if type(step) is not int or step < 0:
@@ -279,20 +228,28 @@ class L1EvidenceBackend:
         if not isinstance(rgb_observation_source, str) or not rgb_observation_source:
             raise ValueError("rgb_observation_source must be a nonempty string")
         packet = ObservationPacket(
-            step_id=step, rgb=rgb, instruction=self.instruction,
+            step_id=step,
+            rgb=rgb,
+            instruction=self.instruction,
             last_action=deepcopy(last_action) if last_action is not None else None,
             prediction=prediction,
         )
         started = time.perf_counter()
+        # Original MemoryManager.observe: a positive velocity command drops the
+        # carried visual place until a new descriptor is observed.  Uni-NaVid
+        # emits discrete actions, so this branch normally does not fire.
+        if MemoryWriter._has_positive_forward_command(last_action):
+            self.place_id = None
         events = self.writer.observe(packet)
-        place_attempted = (
-            self.place_extractor is not None and step % self.place_every_n_steps == 0
+        self.last_place_attempted = (
+            self.place_extractor is not None
+            and step % self.place_every_n_steps == 0
         )
         self.last_place_error = None
         self.last_place_observed = False
-        if place_attempted:
-            self._observe_place(packet, events)
-        self._persist_events(events, rgb_observation_source)
+        if self.last_place_attempted:
+            self._observe_place_v3(packet, events)
+        self._persist_v3_events(events)
         self.last_events = list(events)
         self.last_step = step
         detections = [event for event in events if event.kind in _DETECTION_KINDS]
@@ -304,72 +261,273 @@ class L1EvidenceBackend:
             "detection_evidence_ids": [
                 self._evidence_key(event.event_id) for event in detections
             ],
-            "place_attempted": place_attempted,
+            "place_attempted": self.last_place_attempted,
             "place_observed": self.last_place_observed,
             "place_error": self.last_place_error,
             "place_id": self.place_id,
-            "evidence_record_count": len(self.v3_store.evidence_for_scene(self.scene_id)),
+            "evidence_record_count": len(
+                self.v3_store.evidence_for_scene(self.scene_id)
+            ),
+            "events_persisted": int(self.last_v3_diagnostic.get("events_persisted", 0)),
+            "detection_events_persisted": int(
+                self.last_v3_diagnostic.get("detection_events_persisted", 0)
+            ),
+            "landmark_nodes": int(self.last_v3_diagnostic.get("landmark_nodes", 0)),
+            "place_nodes": int(self.last_v3_diagnostic.get("place_nodes", 0)),
             "detector_error": getattr(self.detector, "last_error", None),
             "observe_ms": (time.perf_counter() - started) * 1000.0,
         }
         self.last_diagnostic = diagnostic
         return list(events), dict(diagnostic)
 
-    def select(self, *, step: int, rgb_width: int) -> L1Selection:
-        if (self.v3_store is None or self.scene_id is None or self.episode_id is None
-                or self.last_step != step):
+    # -- original Local Graph selection -------------------------------------
+
+    @contextmanager
+    def _internal_character_limit(self, value: Optional[int]):
+        """Temporarily set the Local Graph serialization cap.
+
+        ``LocalGraphFusion`` itself is unchanged.  LightNav's token-aware mode
+        disables only its internal character ceiling while a measured token
+        budget owns line selection; the original 320-character value remains
+        this adapter's fallback and is restored after every call.
+        """
+        original = self.local_graph.config
+        if value is None:
+            yield
+            return
+        self.local_graph.config = replace(original, prompt_max_chars=value)
+        try:
+            yield
+        finally:
+            self.local_graph.config = original
+
+    def _build_context(self, *, step: int, rgb_width: int,
+                       internal_char_limit: Optional[int]):
+        assert self.v3_store is not None
+        assert self.scene_id is not None and self.episode_id is not None
+        with self._internal_character_limit(internal_char_limit):
+            return self.local_graph.build(
+                self.v3_store,
+                scene_id=self.scene_id,
+                episode_id=self.episode_id,
+                rollout_idx=self.rollout_idx,
+                step=step,
+                instruction=self.instruction,
+                # Original MemoryManager.get_local_graph_context passes the last
+                # observed place every step, not only on a place-extraction step.
+                current_place_id=self.place_id,
+                rgb_width=rgb_width,
+                events=self.last_events,
+            )
+
+    def select(
+        self,
+        *,
+        step: int,
+        rgb_width: int,
+        token_budget: Optional[MemoryTokenBudget] = None,
+        budget_failure: Optional[TokenBudgetFailure] = None,
+    ) -> L1Selection:
+        """Return the original Local Graph card bounded by the measured budget.
+
+        With a measured ``token_budget`` the Local Graph's internal 320-char
+        cap is disabled exactly as in LightNav's token-aware prompt mode, then
+        whole lines are kept while the exact Uni-NaVid prompt-token delta fits
+        ``available_memory_tokens``.  Without a measurement, the original
+        320-character card is used and the failure reason is reported.
+        """
+        if (
+            self.v3_store is None
+            or self.scene_id is None
+            or self.episode_id is None
+            or self.last_step != step
+        ):
             raise RuntimeError("select requires an observed step in the active episode")
-        organization = self.organizer.build(
-            self.v3_store, scene_id=self.scene_id, episode_id=self.episode_id,
-            rollout_idx=self.rollout_idx, step=step,
-            instruction=self.instruction, rgb_width=rgb_width,
-            events=self.last_events, max_chars=65536,
+
+        token_aware = token_budget is not None and token_budget.measured
+        fallback_reason: Optional[str] = (
+            budget_failure.reason
+            if budget_failure is not None and not token_aware else None
         )
-        organized = tuple(
-            self._from_organized(fact) for fact in organization.selected_facts
+        selection = None
+        builder_context = None
+        if token_aware:
+            try:
+                builder_context = self._build_context(
+                    step=step, rgb_width=rgb_width,
+                    internal_char_limit=UNBOUNDED_CHAR_LIMIT,
+                )
+                if builder_context is not None:
+                    selection = select_context_lines(
+                        builder_context,
+                        capacity_tokens=token_budget.available_tokens,
+                        count_tokens=token_budget.counter,
+                    )
+            except Exception as exc:  # noqa: BLE001 - fall back, never guess
+                fallback_reason = "token_selection_failed: %s: %s" % (
+                    type(exc).__name__, exc,
+                )
+                logger.warning("L1 token selection failed at step=%s: %s", step, exc)
+                token_aware = False
+                selection = None
+
+        if token_aware:
+            context = selection.context if selection is not None else None
+            if context is not None and not context.layer_items:
+                # A header without a complete fact line is not a memory card.
+                context = None
+            prompt_text = (
+                build_context_text(context, max_chars=UNBOUNDED_CHAR_LIMIT)
+                if context is not None else ""
+            )
+            budget_diagnostics = dict(token_budget.diagnostics())
+            budget_diagnostics["memory_block_tokens"] = (
+                selection.block_tokens if selection is not None else 0
+            )
+            budget_diagnostics["omitted_lines_by_tokens"] = (
+                selection.omitted_lines if selection is not None else 0
+            )
+            token_overflow_drops = (
+                selection.omitted_lines if selection is not None else 0
+            )
+            internal_char_limit = "token_budget_owned"
+            if budget_diagnostics.get("available_memory_tokens", 0) <= 0:
+                empty_reason = "no_token_headroom"
+            else:
+                empty_reason = "token_selection_empty"
+        else:
+            builder_context = self._build_context(
+                step=step, rgb_width=rgb_width, internal_char_limit=None,
+            )
+            context = builder_context
+            prompt_text = (
+                build_context_text(
+                    context, max_chars=ORIGINAL_CHAR_FALLBACK,
+                )
+                if context is not None else ""
+            )
+            failure = budget_failure
+            if failure is None and fallback_reason is not None:
+                failure = TokenBudgetFailure(
+                    reason=fallback_reason,
+                    context_limit_tokens=(
+                        token_budget.context_limit_tokens
+                        if token_budget is not None else None
+                    ),
+                    base_prompt_tokens=(
+                        token_budget.base_prompt_tokens
+                        if token_budget is not None else None
+                    ),
+                    generation_reserve_tokens=(
+                        token_budget.generation_reserve_tokens
+                        if token_budget is not None else None
+                    ),
+                )
+            budget_diagnostics = (
+                failure.diagnostics() if failure is not None else {
+                    "budget_source": "char_fallback_320",
+                    "context_limit_tokens": None,
+                    "base_prompt_tokens": None,
+                    "generation_reserve_tokens": None,
+                    "safety_margin_tokens": 1,
+                    "available_memory_tokens": None,
+                    "token_budget_unavailable_reason": None,
+                    "budget_fallback_reason": None,
+                }
+            )
+            token_overflow_drops = 0
+            internal_char_limit = "native_320"
+            empty_reason = "original_context_builder_empty"
+
+        fact_count = (
+            len(builder_context.layer_items) if builder_context is not None else 0
         )
-        graph_context = self.local_graph.build(
-            self.v3_store, scene_id=self.scene_id, episode_id=self.episode_id,
-            rollout_idx=self.rollout_idx, step=step,
-            instruction=self.instruction,
-            current_place_id=self.place_id if self.last_place_observed else None,
-            rgb_width=rgb_width, events=self.last_events,
+        evidence_ids = tuple(dict.fromkeys(
+            ref.event_id
+            for item in (context.layer_items if context is not None else ())
+            for ref in item.evidence_refs
+        ))
+        retained_fact_count = (
+            len(context.layer_items) if context is not None else 0
         )
-        graph = tuple(
-            self._from_graph(item) for item in graph_context.layer_items
-        ) if graph_context is not None else ()
-        self._local_graph_selected_ids = frozenset(
-            evidence_id for fact in graph for evidence_id in fact.evidence_ids
-        )
+        selected = bool(context is not None and prompt_text and evidence_ids)
+        self._selected_ids = frozenset(evidence_ids) if selected else frozenset()
+        if selected:
+            empty_reason = None
+        elif context is None and builder_context is None:
+            empty_reason = "original_builder_empty"
+        budget_diagnostics["budget_fallback_reason"] = fallback_reason
         diagnostics = {
             "step": step,
-            "organized_fact_count": len(organized),
-            "local_graph_fact_count": len(graph),
-            "organized_evidence_ids": sorted({
-                key for fact in organized for key in fact.evidence_ids
-            }),
-            "local_graph_evidence_ids": sorted(self._local_graph_selected_ids),
-            "organizer": organization.diagnostics(),
-            "local_graph_candidate_count": len(graph),
+            "source": "local_graph_fusion",
+            "budget_chars": ORIGINAL_CHAR_FALLBACK,
+            "budget_source": budget_diagnostics.get("budget_source"),
+            "context_limit_tokens": budget_diagnostics.get("context_limit_tokens"),
+            "base_prompt_tokens": budget_diagnostics.get("base_prompt_tokens"),
+            "text_prompt_tokens": budget_diagnostics.get(
+                "text_prompt_tokens"
+            ),
+            "visual_tokens": budget_diagnostics.get("visual_tokens"),
+            "visual_token_accounting": budget_diagnostics.get(
+                "visual_token_accounting"
+            ),
+            "generation_reserve_tokens": budget_diagnostics.get(
+                "generation_reserve_tokens"
+            ),
+            "safety_margin_tokens": budget_diagnostics.get("safety_margin_tokens"),
+            "available_memory_tokens": budget_diagnostics.get(
+                "available_memory_tokens"
+            ),
+            "token_budget_unavailable_reason": budget_diagnostics.get(
+                "token_budget_unavailable_reason"
+            ),
+            "budget_fallback_reason": fallback_reason,
+            "internal_char_limit": internal_char_limit,
+            "max_landmarks": self.max_landmarks,
+            "fact_count": fact_count,
+            "retained_fact_count": retained_fact_count,
+            "omitted_facts": max(0, fact_count - retained_fact_count),
+            "token_overflow_drops": token_overflow_drops,
+            "prompt_chars": len(prompt_text),
+            "prompt_sha256": _sha256(prompt_text) if prompt_text else None,
+            "evidence_ids": list(evidence_ids),
+            "empty_reason": None if selected else empty_reason,
+            "budget": budget_diagnostics,
         }
-        selection = L1Selection(organized, graph, diagnostics)
-        diagnostics["selected_fact_count"] = len(selection.selected_facts)
-        return selection
+        for item in (builder_context.layer_items if builder_context is not None else ()):
+            if not isinstance(item, LayerMemoryItem):
+                raise TypeError("Local Graph returned a non-LayerMemoryItem")
+        return L1Selection(
+            context=context,
+            prompt_text=prompt_text or None,
+            evidence_ids=evidence_ids,
+            diagnostics=diagnostics,
+        )
 
-    def confirm_local_graph(self, evidence_ids: Iterable[str], *, step: int) -> None:
-        if self._local_graph_selected_ids:
-            selected = set(evidence_ids) & self._local_graph_selected_ids
-            if selected:
-                self.local_graph.confirm_injected(selected, step)
-            else:
-                self.local_graph.discard_selection()
-        self._local_graph_selected_ids = frozenset()
+    def confirm_injected(self, evidence_ids: Iterable[str], *, step: int) -> None:
+        """Confirm only when every selected evidence ID reached the prompt."""
+        selected = frozenset(self._selected_ids)
+        self._selected_ids = frozenset()
+        if not selected:
+            return
+        confirmed = frozenset(evidence_ids)
+        if confirmed == selected:
+            self.local_graph.confirm_injected(confirmed, step)
+        else:
+            # Token selection can drop whole trailing lines.  The pending
+            # selection is released, and no reactivation signature is claimed.
+            self.local_graph.discard_selection()
 
-    def discard_local_graph(self) -> None:
+    def discard_selection(self) -> None:
+        self._selected_ids = frozenset()
         self.local_graph.discard_selection()
-        self._local_graph_selected_ids = frozenset()
 
-    def _observe_place(self, packet: ObservationPacket, events: list[MemoryEvent]) -> None:
+    # -- literal copies of the original LightNav methods --------------------
+
+    def _observe_place_v3(
+        self, packet: ObservationPacket, events: list[MemoryEvent],
+    ) -> None:
+        """Capture one DINO observation without claiming physical traversal."""
         assert self.place_extractor is not None
         try:
             feature_method = getattr(self.place_extractor, "extract_features", None)
@@ -387,92 +545,137 @@ class L1EvidenceBackend:
             event_id = "place_observation_%d" % packet.step_id
             self._pending_descriptors[event_id] = descriptor
             event = MemoryEvent(
-                event_id=event_id, step_id=packet.step_id,
+                event_id=event_id,
+                step_id=packet.step_id,
                 kind="place_observation",
                 description="Observed RGB visual place descriptor",
-                confidence=1.0, source=self.place_extractor.source,
-                importance=0.6, episode_id=self.episode_id or "",
+                confidence=1.0,
+                source=self.place_extractor.source,
+                importance=0.6,
+                episode_id=self.episode_id or "",
                 metadata={"descriptor_dim": len(descriptor)},
             )
             self.episodic.add(event)
             self.working.record_event(event)
             events.append(event)
-        except Exception as exc:  # optional descriptor must not fabricate a place
+            self.v3_descriptor = descriptor
+        except Exception as exc:  # noqa: BLE001 - optional descriptor fails closed
             self.last_place_error = "%s: %s" % (type(exc).__name__, exc)
-            logger.warning("L1 place extraction failed at step=%s: %s", packet.step_id, exc)
+            logger.warning(
+                "V3 place extraction failed at step=%s: %s",
+                packet.step_id, exc,
+            )
 
-    def _persist_events(self, events: list[MemoryEvent], rgb_source: str) -> None:
+    def _persist_v3_events(self, events: list[MemoryEvent]) -> None:
+        """Write every valid observed event with a Scene/Episode-qualified key.
+
+        This is the original 75% ``MemoryManager._persist_v3_events`` body.
+        The only difference is that the C adapter always uses the long layer
+        (the formal L1 group runs ``short,mid,long``), so the original
+        ``"long" in self.layers`` condition is always true.
+        """
         assert self.v3_store is not None and self.scene_id is not None
-        instruction_words = set(_words(self.instruction))
+        instruction_words = set(_DETECTION_WORDS.findall(self.instruction.casefold()))
         direct_by_label: dict[str, str] = {}
+        persisted = 0
+        detection_persisted = 0
         visible_landmarks: list[tuple[str, str]] = []
+        landmark_nodes = 0
+        place_nodes = 0
         for event in events:
             is_detection = event.kind in _DETECTION_KINDS
-            label = _remove_prefix(event.description, "Observed ").strip() if is_detection else None
-            payload: dict[str, Any] = {"description": event.description}
-            if is_detection or event.kind == "place_observation":
-                payload["rgb_observation_source"] = rgb_source
-            if event.kind == "place_observation":
-                payload["visual_place_source"] = event.source
-            if is_detection and "bbox_xyxy" in event.metadata:
-                payload["bbox_xyxy"] = list(event.metadata["bbox_xyxy"])
+            label = (
+                removeprefix(event.description, "Observed ").strip()
+                if is_detection else None
+            )
+            payload = {"description": event.description}
             if event.kind in {"action", "turn"}:
                 action = event.metadata.get("action")
                 if isinstance(action, dict):
                     payload["action"] = deepcopy(action)
             source_refs: tuple[str, ...] = ()
             if event.kind == "instruction_match":
-                matched_label = _remove_prefix(
+                matched_label = removeprefix(
                     event.description, "Observed instruction-related ",
                 ).strip().casefold()
                 if matched_label in direct_by_label:
                     source_refs = (direct_by_label[matched_label],)
             terms = tuple(sorted(instruction_words & set(
-                _words(label or event.description)
+                _DETECTION_WORDS.findall((label or event.description).casefold())
             )))
             record = EvidenceRecord(
-                evidence_id=event.event_id, scene_id=self.scene_id,
-                episode_id=event.episode_id, rollout_idx=self.rollout_idx,
-                step=event.step_id, event_type=event.kind,
-                semantic_label=label, payload=payload,
-                visual_descriptor=self._pending_descriptors.pop(event.event_id, None),
+                evidence_id=event.event_id,
+                scene_id=self.scene_id,
+                episode_id=event.episode_id,
+                rollout_idx=self.rollout_idx,
+                step=event.step_id,
+                event_type=event.kind,
+                semantic_label=label,
+                payload=payload,
+                visual_descriptor=self._pending_descriptors.pop(
+                    event.event_id, None,
+                ),
                 detector_name=event.source if is_detection else None,
                 raw_detector_confidence=event.confidence if is_detection else None,
-                instruction_terms=terms, source_evidence_ids=source_refs,
-                observation_status=("observed" if is_detection or event.kind in {
-                    "place_observation", "visual_change", "place_visit",
-                } else "unknown"),
-                spatial_status="observed" if event.kind == "place_observation" else "unknown",
+                instruction_terms=terms,
+                source_evidence_ids=source_refs,
+                observation_status=(
+                    "observed" if is_detection or event.kind in {
+                        "place_observation", "visual_change", "place_visit",
+                    } else "unknown"
+                ),
+                spatial_status=(
+                    "observed" if event.kind == "place_observation" else "unknown"
+                ),
                 traversability_status="unknown",
                 provenance_validity=(
                     event.kind != "instruction_match" or bool(source_refs)
                 ),
             )
             stored = self.v3_store.add(record)
+            persisted += 1
             if is_detection:
+                detection_persisted += 1
                 assert label is not None
                 direct_by_label[label.casefold()] = stored.key
                 landmark = self.v3_store.add_landmark(stored)
                 visible_landmarks.append((landmark.node_id, stored.key))
+                landmark_nodes += 1
             elif event.kind == "place_observation":
                 node = self.v3_store.add_place(stored)
+                place_nodes += 1
                 for landmark_id, landmark_key in visible_landmarks:
                     self.v3_store.add_relation(
-                        node.node_id, landmark_id, "inferred_relation",
+                        node.node_id,
+                        landmark_id,
+                        "inferred_relation",
                         evidence_keys=(stored.key, landmark_key),
                     )
                 prior = self._prior_place_id
                 if prior is not None and prior != node.node_id:
-                    prior_node = next((item for item in self.v3_store.nodes_for_scene(
-                        self.scene_id,
-                    ) if item.node_id == prior), None)
+                    prior_node = next((
+                        item for item in self.v3_store.nodes_for_scene(self.scene_id)
+                        if item.node_id == prior
+                    ), None)
                     if prior_node is not None and prior_node.evidence_ids:
                         self.v3_store.add_relation(
-                            prior, node.node_id, "inferred_relation",
+                            prior,
+                            node.node_id,
+                            "inferred_relation",
                             evidence_keys=(prior_node.evidence_ids[-1], stored.key),
                         )
                 self.place_id = node.node_id
                 self._prior_place_id = node.node_id
+        self.last_v3_diagnostic = {
+            "events_observed": len(events),
+            "events_persisted": persisted,
+            "detection_events_persisted": detection_persisted,
+            "landmark_nodes": landmark_nodes,
+            "place_nodes": place_nodes,
+            "evidence_records": len(
+                self.v3_store.evidence_for_scene(self.scene_id)
+            ),
+        }
 
     def _evidence_key(self, event_id: str) -> str:
         from l3_memory.v3_schemas import canonical_evidence_key
@@ -482,76 +685,8 @@ class L1EvidenceBackend:
             self.scene_id, self.episode_id, self.rollout_idx, event_id,
         )
 
-    def _from_organized(self, fact: L1Fact) -> L1SelectedFact:
-        evidence = self._source_evidence(fact.evidence_ids)
-        return L1SelectedFact(
-            text=fact.line(), label=fact.label, role=fact.role,
-            sector=fact.sector, first_step=fact.first_step,
-            last_step=fact.last_step, sightings=fact.sightings,
-            evidence_ids=fact.evidence_ids, evidence=evidence,
-            selection_source="l1_prompt_organizer",
-        )
 
-    def _from_graph(self, item: LayerMemoryItem) -> L1SelectedFact:
-        ids = tuple(dict.fromkeys(ref.event_id for ref in item.evidence_refs))
-        evidence = self._source_evidence(ids)
-        if not evidence:
-            raise ValueError("local graph selected a fact without source evidence")
-        steps = [entry.observation_step for entry in evidence]
-        place_id = item.metadata.get("place_id")
-        place_evidence_ids: tuple[str, ...] = ()
-        place_source = None
-        if isinstance(place_id, str) and self.v3_store is not None:
-            node = next((node for node in self.v3_store.nodes_for_scene(self.scene_id)
-                         if node.node_id == place_id and node.node_type == "place"), None)
-            if node is not None:
-                place_evidence_ids = tuple(node.evidence_ids)
-                if place_evidence_ids:
-                    record = self.v3_store.get_evidence(place_evidence_ids[-1])
-                    if record is not None:
-                        place_source = record.payload.get("visual_place_source")
-        return L1SelectedFact(
-            text=item.description, label=item.label or evidence[0].object_label or "",
-            role=str(item.metadata.get("role", "history")),
-            sector=item.metadata.get("current_view_sector"),
-            first_step=min(steps), last_step=max(steps),
-            sightings=len(evidence), evidence_ids=ids, evidence=evidence,
-            selection_source="local_graph_fusion",
-            visual_place_id=place_id if isinstance(place_id, str) else None,
-            visual_place_evidence_ids=place_evidence_ids,
-            visual_place_source=place_source,
-        )
+def _sha256(text: str) -> str:
+    import hashlib
 
-    def _source_evidence(self, evidence_ids: Iterable[str]) -> tuple[L1SourceEvidence, ...]:
-        assert self.v3_store is not None
-        result = []
-        for key in evidence_ids:
-            record = self.v3_store.get_evidence(key)
-            if record is None or record.event_type not in _DETECTION_KINDS:
-                raise ValueError("selected L1 fact lacks a persisted RGB detection")
-            raw_bbox = record.payload.get("bbox_xyxy")
-            bbox = None
-            if isinstance(raw_bbox, (list, tuple)) and len(raw_bbox) == 4:
-                bbox = tuple(float(value) for value in raw_bbox)
-            raw_rgb_source = record.payload.get("rgb_observation_source")
-            result.append(L1SourceEvidence(
-                evidence_id=record.key,
-                observation_step=record.step,
-                object_label=record.semantic_label,
-                detection_confidence=record.raw_detector_confidence,
-                detector_name=record.detector_name,
-                rgb_observation_source=(
-                    raw_rgb_source if isinstance(raw_rgb_source, str) else None
-                ),
-                bbox_xyxy=bbox,
-                source_evidence_ids=record.source_evidence_ids,
-            ))
-        return tuple(result)
-
-
-def _words(value: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", value.casefold())
-
-
-def _remove_prefix(value: str, prefix: str) -> str:
-    return value[len(prefix):] if value.startswith(prefix) else value
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

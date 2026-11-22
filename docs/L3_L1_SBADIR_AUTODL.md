@@ -1,4 +1,4 @@
-# L3 三组对照：Organized L3、SBAdir 来源背景、L1 融合
+# L3 三组对照：Organized L3、SBAdir 来源背景、LightNav 原始 L1
 
 本分支 `experiment/l3-l1-sbadir` 把原来的两组实验（L3 vs L3+L1）扩展为三组：
 
@@ -10,17 +10,17 @@
 
 - **A** 严格运行 `7602b254ea514aa71b0057e41b5db3bdfedf9ffa`：直接执行未改动的基线 worktree（其 `run.py` / `agent_uninavid.py` / `l3_memory` 保持 `7602b25` 原字节）；Prompt 只有原始 instruction + L3 Organized 文本。
 - **B** 只启用 L3。它调用**同一个** `compose_sbadir`，但 `l1_facts=()`、`l1_backend=None`，因此不会加载 YOLO 检测权重或 DINOv2，也不产生任何 L1 事实。L3 事实集合、顺序、句子来自冻结的 `7602b25` organizer，不做重写、筛选或重排。
-- **C** 在 B 的 L3 事实与来源背景之上增加 L1 RGB 记忆；L1 事实同样逐条配对真实来源。同实体冲突保留双方事实、共同实体 ID 与双方证据 ID，不判决哪一方正确。
+- **C** 在 B 的 L3 事实与来源背景之上增加 LightNav 75% 基线（tag `baseline-local-graph-fusion-88-sr75`，commit `2fb184e`）的**原始 L1**。L1 只由 `LocalGraphFusion` 构建，不经过 `L1PromptOrganizer`；原始卡逐字追加在 B 块之后，不重写 L1 行、不追加 L1 来源背景、不做 L1/L3 实体融合。
 
 ## 公平性约束
 
-1. B 和 C 的 L3 原始事实必须一致；C 只允许在原始事实句子后追加相同来源背景，再追加 L1 行。
+1. B 和 C 的 L3 原始事实必须一致；C 在 B 的完整 L3+来源背景块之后逐字追加原始 L1 卡。L1 卡不参与 SBAdir，不与 L3 合并。
 2. A、B、C 使用同一份 88 Episode Manifest、同一 checkpoint、同一 seed 42、同一 Habitat 配置、同一推理参数（temperature 0.2、max_new_tokens 1024）。
 3. 三组都只使用 UniNaVid 官方 Prompt 的任务槽；不增加 System/User 角色、特殊 Token 或第二套 Prompt。视觉 Token 顺序、任务指令、动作解码与生成参数不变。
-4. 来源背景只使用实际存在的字段：L3 为 segmentation 来源、map node ID、观察步、segmentation 置信度、evidence ID；L1 为 detector 名、RGB 输入来源、观察步、检测置信度、evidence ID、可选的 DINOv2 visual place 来源与 evidence ID。缺失字段写 `unavailable`，不编造。
+4. 来源背景只使用实际存在的字段：L3 为 segmentation 来源、map node ID、观察步、segmentation 置信度、evidence ID。C 的原始 L1 卡不追加来源后缀，保持 LightNav 原格式。
 5. 来源背景不是传感器可信度评分；实现中没有可信度预测模型。
 
-## 来源背景与冲突
+## 来源背景与原始 L1 卡
 
 `l3_integration/sbadir_fusion.py` 的 `compose_sbadir()` 保留全部 L3 原始行，并在每行末尾追加：
 
@@ -29,15 +29,15 @@
  seg conf x.xx; evidence ...]
 ```
 
-L1 行形如：
+C 的 L1 不由 `compose_sbadir()` 生成，而由未改算法的 `LocalGraphFusion.build()` 生成原始 `MemoryContext`；随后按 LightNav `l1_original_only` 的 token-aware 协议（`context_limit - base_prompt_tokens - max_new_tokens - 1`）逐行选择。只有 tokenizer/context 不可测时才回退到原来的 **320 字符**构建。典型形如：
 
 ```text
-L1 RGB fact: ...; same map entity <object_id>; L3 reports <label>; both retained
-[L1 RGB observation; source ...; RGB input observation.rgb; step N;
- detector conf x.xx; evidence ...]
+[Navigation Memory]
+Current RGB: instruction landmark <label> in the <left|center|right> of the current view (detected; passage unknown).
+Local history: <label> was seen near a visually similar area (possible revisit; current direction and passage unknown).
 ```
 
-只有同一帧内 mask/bbox 唯一重叠验证或 L3 组织器已记录的 `linked_l1_evidence_ids` 才会被视为共同实体。冲突时双方原始值与双方 evidence ID 都进入 Prompt 和 `conflict_evidence_ids`，`resolution="both_retained"`。
+该卡在 B 的完整 L3+来源背景块之后逐字追加。token 预算足够时按原协议保留整行前缀，行放不下就整行丢弃并记录 `token_overflow_drops`；完全不测量时才回退 320 字符卡。预算的 base 不是纯文本：它计入 `prepare_inputs_labels_for_multimodal()` 展开后的视觉 token（按真实 `feat_cache`/`long_feat_cache` 和 online-merge 结构计算，≤64 帧精确，>64 帧取安全上界），因此 token-aware 路径的最终多模态序列受 `context_len - max_new_tokens - 1` 约束；若 B 的 base 本身已超出，或 token/视觉不可测而走 320 回退，则记录 `multimodal_budget_overflow`/`budget_fallback_reason`，不能声称该路径绝对有界。原生参数仍为 `max_landmarks=2`、`prompt_max_chars=320`（回退值）、`reactivation_steps=8`、`place_every_n_steps=5`、detector `every_n_steps=5`、detector confidence `0.25`、`scope=episode_local`。C 不运行 `L1PromptOrganizer`，不做 L1/L3 同实体冲突合并；L1 标签与 L3 标签重复时两块都保留，这是“原始 L1”与“SBAdir L3”并置的明确代价。
 
 ## AutoDL 准备
 
@@ -75,7 +75,9 @@ bash scripts/run_l3_vs_l3l1.sh
 3. 正式运行 A（基线 worktree）→ B（本 worktree，不带任何 `--l1-*` 参数）→ C（本 worktree，带 L1 参数）。
 4. 自动调用 `scripts/build_l3_l1_report.py` 生成三组配对报告。
 
-可选环境变量：`HISTORICAL_RUN_DIR`、`PARENT_MANIFEST`、`CONFIG_PATH`（相对两个 worktree 的同路径）、`SEG_DEVICE`、`L1_DET_DEVICE`、`L1_PLACE_DEVICE`、`L1_DET_CONFIDENCE`、`L1_EVERY_N_STEPS`、`L1_PLACE_EVERY_N_STEPS`、`L1_MAX_ITEMS`、`L1_MAX_TOKENS`。固定 seed 42、L3 最多两条/600 字符、temperature 0.2、max_new_tokens 1024。
+**C smoke 的无事实策略**：LightNav 原始 L1 不保证每一步都有可注入事实，也不保证任意一个 Smoke Episode 都有事实。`scripts/validate_three_group_smoke.py` 因此不再要求 `l1_fact_count_total > 0`；它要求 L1 在每一步实际运行、写入链正常、检测/地点/选择错误计数为 0。若产生事实，则要求原始卡被构建并逐字进入 Prompt；若没有事实，允许 `l1_fact_count_total=0`、`prompt_has_l1_steps=0` 并继续正式实验。只有“无事实却注入 L1”或“有事实却未构建原始卡”才判失败。
+
+可选环境变量：`HISTORICAL_RUN_DIR`、`PARENT_MANIFEST`、`CONFIG_PATH`（相对两个 worktree 的同路径）、`SEG_DEVICE`、`L1_DET_DEVICE`、`L1_PLACE_DEVICE`。L1 的检测阈值与窗口固定为 `0.25 / 5 / 5`、`max_landmarks=2`；`prompt_max_chars=320` 是原生回退值，主预算是模型实测 token 预算。脚本若改动检测/窗口/landmark 数，`run.py` 会拒绝。固定 seed 42、L3 最多两条/600 字符、temperature 0.2、max_new_tokens 1024。
 
 ## 输出
 
@@ -122,7 +124,7 @@ assert all(r["prompt_has_l1_steps"] == 0 for r in rows)
 PY
 ```
 
-B 的每次 prompt 也写入 `steps.jsonl` 的 `sbadir_memory_text`；其中只应出现 `L3 RGB-D map` 来源块，不出现 `L1 RGB observation`。
+B 的每次 prompt 也写入 `steps.jsonl` 的 `sbadir_memory_text`；其中只应出现 `L3 RGB-D map` 来源块，不出现 `[Navigation Memory]` L1 卡。
 
 ## 如何确认 C 的 L3 内容没有被改变
 
@@ -153,9 +155,21 @@ print("88 paired identities OK")
 PY
 ```
 
+## 如何确认 C 的 L1 是 LightNav 原始实现
+
+1. **源码层**：`l1_memory/provenance.json` 把 L1 文件钉到 LightNav tag `baseline-local-graph-fusion-88-sr75` / commit `2fb184e`；`tests/test_l1_source_consistency.py` 逐文件比较来源 SHA256，并确认 `local_graph_fusion.py` 在 `2fb184e` 与复制来源提交 `6aefffa` 中逐字节相同。C 的 `l1_integration/sbadir_backend.py` 不导入 `L1PromptOrganizer`，不出现 `L1SelectedFact`/`selected_facts`，不设置 65536 字符上限。
+2. **写入层**：`l1_integration/sbadir_backend.py` 的 `observe`、`_observe_place_v3`、`_persist_v3_events` 是 LightNav 原始 `MemoryManager` 方法的适配副本；`v3_store` 记录仍由 `MemoryWriter` 产生。`run_config.json` 的 `l1.builder` 必须是 `local_graph_fusion`，`l1.prompt_max_chars` 必须是 320（原生回退值），`l1.max_items` 必须是 2，`l1.budget.strategy` 必须是 `token_aware_context`。
+3. **Prompt 层**：`steps.jsonl` 中每个 `prompt_has_l1=true` 的 step 必须记录 `l1_context_text`；它以 `[Navigation Memory]
+` 开头、SHA256 等于 `l1_prompt_sha256`、并在 `prompt_text` 中逐字出现。token-aware 卡可超过 320 字符，但注入的 token 增量不超过测得的 `available_memory_tokens`；`budget_source=char_fallback_320` 时仍必须 ≤320。报告会重新校验这些条件。L1 块在 B 的 `l3_enriched_text` 之后，且不包含 `L1 RGB fact`/`L1 RGB observation` 后缀。
+4. **隔离层**：C 的 L1 失败或空卡不改变 L3 事实、L3 来源背景或官方 Prompt 前缀；`b_c_l3_background_equal_on_common_prefix` 与 `l3_original_memory_unchanged` 仍必须为真。
+5. **预算层**：L1 使用模型实测 token 预算（`context_limit - (text_prompt_tokens + visual_tokens) - max_new_tokens - 1`）、2 个 landmark、8 步 reactivation、5 步地点窗口；token 不可测时回退 320 字符并记录 `budget_fallback_reason`。没有 160 token/600 字符的 L1 预算，没有 `L1PromptOrganizer`，没有额外置信度或 instruction-related fact 筛选。放不下时整行丢弃或整卡省略，不截断半行。
+
 ## 本机验证状态
 
-- 本机 Python 3.8 CPU 回归：`175 passed`（排除需要 torch 的 `test_agent_contract.py`、`test_prompt_audit.py`、`test_prompt_tokens.py`）。
-- 新增 `tests/test_three_group_experiment.py`：覆盖 A 无来源背景、B 无 L1、B L3 事实与来源、C 复用 B 的 L3 文本/来源背景、C 增加 L1、同实体冲突双方保留、冲突 ID 进入 Prompt、官方 Prompt 快照、Python 3.8 兼容，并用 `tests/sbadir_agent_probe.py` 在 CPU 上真实调用 agent 的 `act()` 验证 B/C。
-- 新增 `tests/test_launcher_smoke_validator.py`：验证正式运行前的三组 smoke 门禁；`scripts/validate_three_group_smoke.py` 被启动脚本直接调用。
-- 本机没有 Habitat/torch/真实 checkpoint/冻结 Manifest，未执行正式 GPU 实验，也没有真实 88 Episode 结果；上述运行路径和命令供 AutoDL 执行。
+- 本机 Python 3.8 CPU 回归：`213 passed`（排除需要 torch 的 `test_agent_contract.py`、`test_prompt_audit.py`、`test_prompt_tokens.py`）。
+- `tests/test_l1_source_consistency.py`：把 C 的 L1 文件钉到 LightNav 75% tag/commit `2fb184e`，逐文件校验来源 SHA256，并确认 `LocalGraphFusion` 在 `2fb184e` 与后续复制提交 `6aefffa` 中逐字节相同；同时禁止 C 引入 `L1PromptOrganizer`、`L1SelectedFact`、`selected_facts` 或 65536 字符上限。
+- `tests/test_l1_sbadir_backend.py` 与 `tests/test_l1_token_budget.py`：覆盖原始 `MemoryWriter`/`_observe_place_v3`/`_persist_v3_events` 写入、`LocalGraphFusion` 当前卡与历史卡、0.5 原始置信度过滤、token 预算公式、逐行截断、320 回退、8 步 reactivation、Episode 隔离，以及“无检测→空卡且不抛异常”。`tests/test_l1_multimodal_tokens.py` 与 `tests/test_multimodal_merge_reference.py` 覆盖 `online_process_tensor` 视觉 token 上界、`context_len - max_new_tokens - 1` 守卫与真实 merge 参考比较。
+- `tests/test_three_group_experiment.py`：覆盖 A 无来源背景、B 无 L1、B L3 事实与来源、C 在 B 块后逐字追加原始 L1 卡、无 L1 卡时 B Prompt 字节不变、容量不足整卡省略、回退路径超 320 字符拒绝、token-aware 路径允许超 320、官方 Prompt 快照。
+- `tests/test_three_group_agent_prompt.py` + `tests/sbadir_agent_probe.py`：在 CPU 上真实调用 agent 的 `act()`，验证 A/B/C Prompt、C 的 L1 卡逐字进入任务槽、token-aware 预算公式与逐 Step 诊断、回退原因，以及 `c-empty` 无 L1 事实场景仍完成两步且无异常。
+- `tests/test_launcher_smoke_validator.py` 与 `tests/test_l3_l1_launcher_report.py`：新增“C 无 L1 事实 smoke 通过、不得中止”“C 单个 Episode 无 L1 事实时报告仍可构建”回归用例，以及“无事实却注入 L1”“有事实却未构建原始卡”两个负例。`scripts/validate_three_group_smoke.py` 不再要求 C 必须有 L1 事实。
+- `scripts/smoke_l3_cpu.py` 的 L3 CPU smoke 通过；本机没有 Habitat/torch/真实 checkpoint/冻结 Manifest，未执行正式 GPU 实验，也没有真实 88 Episode 结果；上述运行路径和命令供 AutoDL 执行。

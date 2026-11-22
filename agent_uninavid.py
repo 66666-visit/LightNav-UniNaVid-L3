@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from html import escape
 import torch
 import cv2
 import imageio
@@ -20,13 +21,31 @@ from l3_integration.official_prompt import (
     prompt_sha256,
     verify_task_text_injection,
 )
-from l3_integration.sbadir_fusion import compose_sbadir
+from l1_integration.multimodal_tokens import (
+    navigation_nav_size,
+    navigation_visual_token_accounting,
+)
+from l1_integration.token_budget import (
+    MemoryTokenBudget,
+    TokenBudgetFailure,
+    build_token_budget,
+)
+from l3_integration.sbadir_fusion import (
+    ORIGINAL_L1_PROMPT_MAX_CHARS,
+    append_original_l1,
+    compose_sbadir,
+)
 
 from uninavid.mm_utils import get_model_name_from_path
 from uninavid.model.builder import load_pretrained_model
 from uninavid.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from uninavid.conversation import conv_templates, SeparatorStyle
 from uninavid.mm_utils import tokenizer_image_token, KeywordsStoppingCriteria
+
+
+#: The official decoder's fixed generation reserve.  The L1 budget subtracts
+#: exactly this value and one safety token, not a hand-set reserve.
+OFFICIAL_MAX_NEW_TOKENS = 1024
 
 
 @contextlib.contextmanager
@@ -59,7 +78,7 @@ def _preserve_rng_state():
 class UniNaVid_Agent(Agent):
     def __init__(self, model_path, result_path, exp_save, l3_sidecar=None,
                  env=None, config=None, experiment_group="uninavid_baseline",
-                 l1_backend=None, l1_max_tokens=160, source_background=False):
+                 l1_backend=None, source_background=False):
         
         print("Initialize UniNaVid")
 
@@ -75,7 +94,6 @@ class UniNaVid_Agent(Agent):
                 )
         self.l3 = l3_sidecar
         self.l1 = l1_backend
-        self.l1_max_tokens = l1_max_tokens
         #: B enables only the SBAdir evidence/source pairing; C enables it too
         #: and additionally carries the L1 RGB memory.
         self.source_background = bool(source_background)
@@ -107,6 +125,9 @@ class UniNaVid_Agent(Agent):
 
         self.model_name = get_model_name_from_path(model_path)
         self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(model_path, None, get_model_name_from_path(model_path))
+        # The official generate call below uses 1024.  Keep one explicit value
+        # so the L1 budget reserve is the same number the decoder consumes.
+        self.max_new_tokens = OFFICIAL_MAX_NEW_TOKENS
 
 
         print("Initialization Complete")
@@ -320,6 +341,7 @@ class UniNaVid_Agent(Agent):
         self.rgb_list = []
         self.topdown_map_list = []
         self.last_action = None
+        self.last_prediction = None
         self.count_id += 1
         self.count_stop = 0
         self.pending_action_list = []
@@ -340,6 +362,8 @@ class UniNaVid_Agent(Agent):
         self.last_task_text = None
         self.last_l3_context_text = None
         self.last_sbadir_memory_text = None
+        self.last_l1_context_text = None
+        self.last_l1_prompt_text = None
         self.episode_instruction = instruction
         if getattr(self, "l1", None) is not None:
             if episode is None:
@@ -375,6 +399,7 @@ class UniNaVid_Agent(Agent):
                 _events, result = backend.observe(
                     rgb, step, rgb_observation_source="observation.rgb",
                     last_action=self.last_action,
+                    prediction=getattr(self, "last_prediction", None),
                 )
             return {"l1_enabled": True, **{
                 "l1_" + str(key): value for key, value in result.items()
@@ -431,6 +456,205 @@ class UniNaVid_Agent(Agent):
             return int(len(self.tokenizer.encode(text, add_special_tokens=False)))
         except Exception:  # noqa: BLE001 - token accounting is diagnostic only
             return None
+
+
+    def _count_prompt_tokens(self, prompt):
+        """Count the exact Uni-NaVid token stream for one prompt string.
+
+        ``predict_inference`` builds the prompt with ``tokenizer_image_token``
+        and then replaces each image placeholder with six extra special-token
+        sequences (the placeholder id itself is kept).  This method counts the
+        same stream without materialising CUDA tensors, so the L1 budget is
+        measured by the checkpoint tokenizer rather than by a LightNav token
+        count or a character estimate.
+        """
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None or not callable(tokenizer):
+            raise RuntimeError("checkpoint tokenizer is unavailable")
+        image_index = IMAGE_TOKEN_INDEX
+        if not isinstance(image_index, int):
+            raise RuntimeError("Uni-NaVid image token index is unavailable")
+        # Reproduce the exact conversation/template transformation performed by
+        # predict_inference before tokenizer_image_token.  Counting the raw
+        # official string would omit the chat-template tokens.
+        qs = prompt
+        if self.model.config.mm_use_im_start_end:
+            qs = (
+                DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+                + "\n" + qs.replace("<image>", "")
+            )
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + "\n" + qs.replace("<image>", "")
+        conv = conv_templates[self.conv_mode].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        rendered_prompt = conv.get_prompt()
+        ids = tokenizer_image_token(rendered_prompt, tokenizer, image_index)
+        if ids is None:
+            raise RuntimeError("tokenizer_image_token returned no token ids")
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        ids = list(ids)
+        image_count = sum(1 for token in ids if token == image_index)
+        extra = 0
+        # ``predict_inference`` inserts these six sequences for every image
+        # placeholder and keeps the placeholder token itself.
+        for special in (
+            "<video_special>", "<image_sep>", "</video_special>",
+            "<image_special>", "</image_special>", "[Navigation]",
+        ):
+            encoded = tokenizer(special, return_tensors="pt").input_ids
+            if hasattr(encoded, "tolist"):
+                encoded = encoded.tolist()
+            encoded = list(encoded)
+            row = encoded[0] if encoded and isinstance(
+                encoded[0], (list, tuple)
+            ) else encoded
+            extra += len(list(row)[1:])
+        return len(ids) + image_count * extra
+
+
+    @staticmethod
+    def _cache_first_dim(cache):
+        """Length of the frame dimension of a feat/online-merge cache."""
+        if cache is None:
+            return 0
+        shape = getattr(cache, "shape", None)
+        if shape is None:
+            raise RuntimeError("Uni-NaVid visual cache has no shape")
+        if len(shape) < 1:
+            raise RuntimeError("Uni-NaVid visual cache is not frame-major")
+        return int(shape[0])
+
+
+    def _visual_token_accounting(self):
+        """Measure the online-merge visual token block before generation.
+
+        ``prepare_inputs_labels_for_multimodal`` replaces the text
+        ``<image>`` placeholder with the current online-merge groups, one
+        separator between groups, and 64 navigation tokens.  The number of
+        long-term groups can only be finalised after the vision tower runs;
+        this method reserves the exact upper bound from the real
+        ``feat_cache``/``long_feat_cache`` lengths.  It is exact for <=64
+        frames and over-reserves at most two tokens per new frame above 64.
+        """
+        model = getattr(self, "model", None)
+        if model is None:
+            raise RuntimeError("checkpoint model is unavailable")
+        get_inner = getattr(model, "get_model", None)
+        inner = get_inner() if callable(get_inner) else getattr(model, "model", None)
+        if inner is None:
+            raise RuntimeError("checkpoint inner model is unavailable")
+        config = getattr(model, "config", None)
+        nav_size = navigation_nav_size(getattr(config, "compress_type", None))
+        new_frames = len(getattr(self, "rgb_list", ()) or ())
+        if new_frames < 1:
+            raise RuntimeError("no RGB frames are available for visual accounting")
+        feat_cache = getattr(inner, "feat_cache", None)
+        long_cache = getattr(inner, "long_feat_cache", None)
+        if feat_cache is not None:
+            shape = tuple(getattr(feat_cache, "shape", ()))
+            if len(shape) != 3 or int(shape[1]) != nav_size:
+                raise RuntimeError(
+                    "feat_cache shape does not match compress_type/nav_size"
+                )
+        if long_cache is not None:
+            shape = tuple(getattr(long_cache, "shape", ()))
+            if len(shape) != 2:
+                raise RuntimeError("long_feat_cache is not a 2-D cache")
+        accounting = navigation_visual_token_accounting(
+            cached_frames=self._cache_first_dim(feat_cache),
+            cached_long_entries=self._cache_first_dim(long_cache),
+            new_frames=new_frames,
+            nav_size=nav_size,
+        )
+        return accounting
+
+
+    def _measure_l1_token_budget(self, *, instruction, base_memory_text):
+        """Measure C's free prompt tokens with the real Uni-NaVid tokenizer.
+
+        ``base_memory_text`` is B's frozen L3+source-background block, so the
+        measured base prompt is exactly what C would send without L1.  The
+        base count includes both the text/special-token stream and the
+        online-merge visual block that replaces ``<image>``.  The formula is
+        LightNav's ``context_limit - base_prompt_tokens - max_new_tokens - 1``;
+        only the measurement source differs.
+        """
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None or not callable(tokenizer):
+            return TokenBudgetFailure(
+                reason="tokenizer_unavailable: the checkpoint tokenizer is not "
+                       "loaded for prompt measurement",
+            )
+        try:
+            base_prompt = build_prompt(
+                self.promt_template,
+                build_task_text(instruction, base_memory_text),
+            )
+            base_tokens = int(self._count_prompt_tokens(base_prompt))
+        except Exception as exc:  # noqa: BLE001 - report, never guess
+            return TokenBudgetFailure(
+                reason="prompt_measurement_failed: {}: {}".format(
+                    type(exc).__name__, exc,
+                ),
+                context_limit_tokens=(
+                    self.context_len
+                    if type(getattr(self, "context_len", None)) is int else None
+                ),
+            )
+        context_limit = getattr(self, "context_len", None)
+        try:
+            visual = self._visual_token_accounting()
+        except Exception as exc:  # noqa: BLE001 - report, never guess
+            return TokenBudgetFailure(
+                reason="visual_token_accounting_failed: {}: {}".format(
+                    type(exc).__name__, exc,
+                ),
+                context_limit_tokens=(
+                    context_limit if type(context_limit) is int else None
+                ),
+                base_prompt_tokens=None,
+                text_prompt_tokens=base_tokens,
+            )
+        visual_tokens = int(visual["visual_tokens_net"])
+        multimodal_base_tokens = base_tokens + visual_tokens
+        max_new_tokens = getattr(
+            self, "max_new_tokens", OFFICIAL_MAX_NEW_TOKENS,
+        )
+        base_block = (
+            base_memory_text
+            if isinstance(base_memory_text, str) and base_memory_text.strip()
+            else None
+        )
+
+        def count_l1_memory(text):
+            safe_text = escape(text.strip(), quote=False)
+            memory = (
+                safe_text if base_block is None
+                else base_block + "\n" + safe_text
+            )
+            candidate_task = build_task_text(instruction, memory)
+            return (
+                int(self._count_prompt_tokens(
+                    build_prompt(self.promt_template, candidate_task)
+                )) - base_tokens
+            )
+
+        return build_token_budget(
+            context_limit_tokens=context_limit,
+            base_prompt_tokens=multimodal_base_tokens,
+            generation_reserve_tokens=max_new_tokens,
+            counter=count_l1_memory,
+            context_limit_source=(
+                "UniNaVid load_pretrained_model.context_len "
+                "(model.config.max_sequence_length else 2048) + "
+                "online-merge visual upper bound"
+            ),
+            text_prompt_tokens=base_tokens,
+            visual_tokens=visual_tokens,
+            visual_accounting=visual,
+        )
 
 
     def _augment_task_text(self, instruction, step, diagnostic):
@@ -495,11 +719,14 @@ class UniNaVid_Agent(Agent):
 
 
     def _augment_sbadir_task_text(self, instruction, step, diagnostic):
-        """Pair L3 facts (and optionally L1 facts) with their real sources.
+        """Pair B's L3 facts with sources, then append C's original L1 card.
 
-        B passes ``l1=None`` and therefore feeds an empty L1 fact list into the
-        same ``compose_sbadir`` code path used by C.  The L3 organizer is read
-        once; its facts, order and text are never rewritten.
+        B passes ``l1=None`` and uses the frozen ``compose_sbadir`` path.
+        C keeps that entire B block byte-identical and appends the original
+        Local Graph card selected by the LightNav L1 path.  The card's whole
+        lines are selected against the measured Uni-NaVid prompt-token budget;
+        a line that does not fit is omitted, never cut.  The L1 card is not
+        passed through SBAdir and is never rewritten line by line.
         """
         backend = getattr(self, "l1", None)
         sidecar = getattr(self, "l3", None)
@@ -522,16 +749,14 @@ class UniNaVid_Agent(Agent):
             if organization is not None else ()
         )
         self.last_l3_context_text = l3_context
-        l1_facts = ()
+
         selection = None
-        if backend is not None and getattr(backend, "last_step", None) == step:
-            with _preserve_rng_state():
-                selection = backend.select(step=step, rgb_width=int(self.rgb_list[-1].shape[1]))
-            l1_facts = selection.selected_facts
-            diagnostic["l1_selection"] = selection.diagnostics
-            diagnostic["l1_fact_records"] = [fact.to_dict() for fact in l1_facts]
-        elif backend is not None:
-            diagnostic["l1_selection_error"] = "L1 observation unavailable at this step"
+        l1_prompt_text = None
+        l1_fact_count = 0
+        l1_retained_fact_count = 0
+        l1_selection_diagnostics = {}
+        l1_budget = None
+        l1_budget_failure = None
 
         def count_tokens_strict(value):
             count = self._count_tokens(value)
@@ -539,27 +764,239 @@ class UniNaVid_Agent(Agent):
                 raise RuntimeError("checkpoint tokenizer did not count prompt tokens")
             return count
 
+        def count_prompt_tokens_strict(value):
+            # Same exact Uni-NaVid stream used by _measure_l1_token_budget.
+            return int(self._count_prompt_tokens(value))
+
         if type(self.context_len) is not int or self.context_len <= 1024 + 64:
             raise RuntimeError("checkpoint context limit cannot hold official generation reserve")
-        # The official decoder keeps max_new_tokens=1024.  Reserve 64 tokens
-        # for its conversation/visual markers in addition to the text count.
+        # B's frozen reserve: the official decoder keeps max_new_tokens=1024 and
+        # B has always reserved 64 extra text tokens for its conversation and
+        # visual markers.  Do not change this: B is frozen.
         capacity = self.context_len - 1024 - 64
+        # B's block: L3 organizer facts + per-fact source background.  C does
+        # not feed L1 facts into this SBAdir path.
         fused = compose_sbadir(
             template=self.promt_template, instruction=instruction,
-            l3_text=l3_context, l3_facts=l3_facts, l1_facts=l1_facts,
+            l3_text=l3_context, l3_facts=l3_facts, l1_facts=(),
             count_tokens=count_tokens_strict,
             max_prompt_tokens=capacity,
-            l1_max_tokens=getattr(self, "l1_max_tokens", 160),
             entity_links=sidecar.cross_sensor_links,
         )
         if fused.diagnostics["omitted_l3_provenance"]:
             raise RuntimeError("L3 source background did not fit measured prompt capacity")
-        self.last_sbadir_memory_text = fused.memory_text
+
+        if backend is not None:
+            l1_budget_measurement = self._measure_l1_token_budget(
+                instruction=instruction,
+                base_memory_text=fused.memory_text,
+            )
+            if isinstance(l1_budget_measurement, MemoryTokenBudget):
+                l1_budget = l1_budget_measurement
+            else:
+                l1_budget_failure = l1_budget_measurement
+            if getattr(backend, "last_step", None) == step:
+                try:
+                    with _preserve_rng_state():
+                        selection = backend.select(
+                            step=step,
+                            rgb_width=int(self.rgb_list[-1].shape[1]),
+                            token_budget=l1_budget,
+                            budget_failure=l1_budget_failure,
+                        )
+                except Exception as exc:  # noqa: BLE001 - L1 is optional memory
+                    diagnostic["l1_selection_error"] = "%s: %s" % (
+                        type(exc).__name__, exc,
+                    )
+                else:
+                    l1_prompt_text = selection.prompt_text
+                    l1_selection_diagnostics = dict(selection.diagnostics)
+                    l1_fact_count = int(l1_selection_diagnostics.get(
+                        "fact_count", selection.fact_count,
+                    ) or 0)
+                    l1_retained_fact_count = int(l1_selection_diagnostics.get(
+                        "retained_fact_count", l1_fact_count,
+                    ) or 0)
+                    diagnostic["l1_selection"] = l1_selection_diagnostics
+            else:
+                diagnostic["l1_selection_error"] = (
+                    "L1 observation unavailable at this step"
+                )
+        self.last_l1_context_text = l1_prompt_text
+        self.last_l1_prompt_text = l1_prompt_text
+
+        l1_token_aware = (
+            selection is not None
+            and l1_selection_diagnostics.get("budget_source")
+            == "token_aware_context"
+        )
+        if l1_token_aware and backend is not None:
+            visual_tokens = int(getattr(l1_budget, "visual_tokens", 0) or 0)
+            max_prompt_tokens = (
+                self.context_len
+                - visual_tokens
+                - int(getattr(
+                    self, "max_new_tokens", OFFICIAL_MAX_NEW_TOKENS,
+                ))
+                - 1
+            )
+            l1_result = append_original_l1(
+                template=self.promt_template,
+                instruction=instruction,
+                base_memory_text=fused.memory_text,
+                l1_text=l1_prompt_text,
+                count_tokens=(
+                    count_prompt_tokens_strict
+                    if l1_prompt_text is not None else None
+                ),
+                max_prompt_tokens=(
+                    max_prompt_tokens
+                    if l1_prompt_text is not None and max_prompt_tokens > 0
+                    else None
+                ),
+                char_budget=None,
+                token_aware=True,
+            )
+        elif backend is not None:
+            # Measured token budget unavailable or token selection failed:
+            # use the original 320-character Local Graph card exactly as the
+            # LightNav fallback does, and report the reason.  No token capacity
+            # is invented for this path.
+            l1_result = append_original_l1(
+                template=self.promt_template,
+                instruction=instruction,
+                base_memory_text=fused.memory_text,
+                l1_text=l1_prompt_text,
+                count_tokens=None,
+                max_prompt_tokens=None,
+                char_budget=ORIGINAL_L1_PROMPT_MAX_CHARS,
+                token_aware=False,
+            )
+        else:
+            # B is unchanged: no L1 backend and no L1 text.
+            l1_result = append_original_l1(
+                template=self.promt_template,
+                instruction=instruction,
+                base_memory_text=fused.memory_text,
+                l1_text=l1_prompt_text,
+                count_tokens=count_tokens_strict,
+                max_prompt_tokens=capacity,
+                char_budget=ORIGINAL_L1_PROMPT_MAX_CHARS,
+                token_aware=False,
+            )
+
+        if (l1_result.l1_text is not None
+                and selection is not None and backend is not None):
+            # Only the facts that survived token selection reached the prompt.
+            backend.confirm_injected(selection.evidence_ids, step=step)
+        elif backend is not None:
+            backend.discard_selection()
+
+        combined_memory = l1_result.memory_text
+        self.last_sbadir_memory_text = combined_memory
         diagnostic.update(fused.diagnostics)
-        diagnostic["context_injected"] = bool(fused.memory_text)
+        diagnostic.update(l1_result.diagnostics)
+
+        budget_diagnostics = dict(l1_selection_diagnostics.get("budget") or {})
+        if not budget_diagnostics:
+            budget_source = l1_budget if l1_budget is not None else l1_budget_failure
+            if budget_source is not None:
+                budget_diagnostics = dict(budget_source.diagnostics())
+        if backend is not None:
+            fallback_reason = l1_selection_diagnostics.get(
+                "budget_fallback_reason"
+            )
+            if fallback_reason is None and selection is None:
+                fallback_reason = budget_diagnostics.get(
+                    "budget_fallback_reason"
+                )
+            injected_tokens = l1_result.diagnostics.get("l1_token_count")
+            diagnostic["budget_source"] = (
+                l1_selection_diagnostics.get("budget_source")
+                or budget_diagnostics.get("budget_source")
+            )
+            diagnostic["l1_budget_source"] = diagnostic["budget_source"]
+            diagnostic["context_limit_tokens"] = (
+                l1_selection_diagnostics.get("context_limit_tokens")
+                if l1_selection_diagnostics.get("context_limit_tokens") is not None
+                else budget_diagnostics.get("context_limit_tokens")
+            )
+            diagnostic["base_prompt_tokens"] = (
+                l1_selection_diagnostics.get("base_prompt_tokens")
+                if l1_selection_diagnostics.get("base_prompt_tokens") is not None
+                else budget_diagnostics.get("base_prompt_tokens")
+            )
+            diagnostic["available_memory_tokens"] = (
+                l1_selection_diagnostics.get("available_memory_tokens")
+                if l1_selection_diagnostics.get("available_memory_tokens") is not None
+                else budget_diagnostics.get("available_memory_tokens")
+            )
+            diagnostic["budget_fallback_reason"] = fallback_reason
+            diagnostic["memory_tokens_injected"] = (
+                injected_tokens if l1_result.l1_text is not None else 0
+            )
+            diagnostic["token_overflow_drops"] = (
+                int(l1_selection_diagnostics.get(
+                    "token_overflow_drops", 0,
+                ) or 0)
+                + int(l1_result.diagnostics.get(
+                    "token_overflow_drops", 0,
+                ) or 0)
+            )
+            text_prompt_tokens = (
+                l1_selection_diagnostics.get("text_prompt_tokens")
+                if l1_selection_diagnostics.get("text_prompt_tokens") is not None
+                else budget_diagnostics.get("text_prompt_tokens")
+            )
+            visual_tokens = (
+                l1_selection_diagnostics.get("visual_tokens")
+                if l1_selection_diagnostics.get("visual_tokens") is not None
+                else budget_diagnostics.get("visual_tokens")
+            )
+            visual_accounting = (
+                l1_selection_diagnostics.get("visual_token_accounting")
+                or budget_diagnostics.get("visual_token_accounting")
+            )
+            multimodal_limit = (
+                self.context_len
+                - int(getattr(
+                    self, "max_new_tokens", OFFICIAL_MAX_NEW_TOKENS,
+                ))
+                - 1
+            )
+            diagnostic["text_prompt_tokens"] = text_prompt_tokens
+            diagnostic["visual_tokens"] = visual_tokens
+            diagnostic["visual_token_accounting"] = visual_accounting
+            diagnostic["multimodal_prompt_limit_tokens"] = multimodal_limit
+            base_prompt_tokens = diagnostic["base_prompt_tokens"]
+            multimodal_prompt_tokens = None
+            context_margin_tokens = None
+            if base_prompt_tokens is not None:
+                multimodal_prompt_tokens = int(base_prompt_tokens)
+                if (l1_result.l1_text is not None
+                        and injected_tokens is not None):
+                    multimodal_prompt_tokens += int(injected_tokens)
+                context_margin_tokens = (
+                    multimodal_limit - multimodal_prompt_tokens
+                )
+            diagnostic["multimodal_prompt_tokens"] = multimodal_prompt_tokens
+            diagnostic["context_margin_tokens"] = context_margin_tokens
+            diagnostic["multimodal_prompt_tokens_is_upper_bound"] = (
+                bool(visual_accounting)
+                and visual_accounting.get("exact") is not True
+            )
+            diagnostic["multimodal_budget_overflow"] = bool(
+                context_margin_tokens is not None
+                and context_margin_tokens < 0
+            )
+
+        diagnostic["context_injected"] = bool(combined_memory)
         diagnostic["prompt_has_l3"] = bool(l3_context)
-        diagnostic["prompt_has_l1"] = bool(fused.l1_text)
+        diagnostic["prompt_has_l1"] = l1_result.l1_text is not None
         diagnostic["fact_count"] = len(l3_facts)
+        diagnostic["memory_fact_count"] = (
+            len(l3_facts) + l1_retained_fact_count
+        )
         diagnostic["context_chars"] = len(l3_context or "")
         # Match A's standalone L3 tokenizer count for A/B reporting.  The
         # marginal full-prompt delta remains separately logged for budgeting.
@@ -569,28 +1006,51 @@ class UniNaVid_Agent(Agent):
         diagnostic["l3_original_memory_unchanged"] = bool(
             fused.diagnostics["l3_core_unchanged"]
         )
-        diagnostic["source_background_facts"] = (
+        # SBAdir source backgrounds belong to B's frozen L3 block only.  The
+        # original L1 card is inserted verbatim and carries no source suffix.
+        diagnostic["source_background_facts"] = int(
             fused.diagnostics["l3_provenance_count"]
-            + fused.diagnostics["l1_retained_facts"]
+        )
+        diagnostic["l1_fact_count"] = l1_fact_count
+        if backend is not None:
+            diagnostic["l1_retained_fact_count"] = (
+                l1_retained_fact_count
+                if l1_result.l1_text is not None else 0
+            )
+        diagnostic["l1_prompt_built"] = l1_prompt_text is not None
+        diagnostic["l1_prompt_chars"] = len(l1_prompt_text or "")
+        diagnostic["l1_prompt_sha256"] = (
+            l1_selection_diagnostics.get("prompt_sha256")
+            if selection is not None else None
+        )
+        diagnostic["l1_budget_chars"] = ORIGINAL_L1_PROMPT_MAX_CHARS
+        diagnostic["l1_retained_facts"] = (
+            l1_retained_fact_count
+            if l1_result.l1_text is not None else 0
+        )
+        diagnostic["l1_omitted_facts"] = (
+            l1_fact_count - diagnostic["l1_retained_facts"]
+        )
+        diagnostic["l1_empty_reason"] = (
+            l1_selection_diagnostics.get("empty_reason")
+            or l1_result.diagnostics.get("empty_reason")
+        )
+        diagnostic["l1_injected_evidence_ids"] = (
+            list(selection.evidence_ids)
+            if selection is not None and l1_result.l1_text is not None else []
+        )
+        diagnostic["retained_facts"] = (
+            len(l3_facts) + diagnostic["l1_retained_facts"]
+        )
+        diagnostic["omitted_facts"] = (
+            int(fused.diagnostics.get("omitted_facts", 0))
+            + diagnostic["l1_omitted_facts"]
         )
         diagnostic["conflict_type_counts"] = {
-            "object_label": fused.diagnostics["conflicting_facts"]
+            "object_label": int(fused.diagnostics["conflicting_facts"])
         }
-        diagnostic["conflict_evidence_ids"] = [
-            {
-                "l1": entry["l1_evidence_ids"],
-                "l3": entry["l3_evidence_ids"],
-            }
-            for entry in fused.diagnostics["conflicts"]
-        ]
-        if selection is not None:
-            retained_ids = {
-                evidence_id
-                for ids in fused.diagnostics["l1_retained_evidence_ids"]
-                for evidence_id in ids
-            }
-            backend.confirm_local_graph(retained_ids, step=step)
-        return fused.task_text, fused.memory_text, diagnostic
+        diagnostic["conflict_evidence_ids"] = []
+        return l1_result.task_text, combined_memory, diagnostic
 
 
     @staticmethod
@@ -617,6 +1077,7 @@ class UniNaVid_Agent(Agent):
             row["prompt_text"] = prompt_text
             row["task_text"] = self.last_task_text
             row["l3_context_text"] = self.last_l3_context_text
+            row["l1_context_text"] = self.last_l1_context_text
             if getattr(self, "source_background", False):
                 row["sbadir_memory_text"] = self.last_sbadir_memory_text
         row.setdefault("l3_enabled", getattr(self, "l3", None) is not None)
@@ -731,12 +1192,33 @@ class UniNaVid_Agent(Agent):
             summary.update({
                 "source_background_enabled": True,
                 "l1_enabled": backend_present,
-                "l1_fact_count_total": totals["l1_retained_facts_total"],
-                "prompt_has_l1_steps": sum(bool(row.get("prompt_has_l1")) for row in prompt_rows),
+                "l1_fact_count_total": totals["l1_fact_count_total"],
+                "l1_retained_facts_total": totals["l1_retained_facts_total"],
+                "l1_omitted_facts_total": totals["l1_omitted_facts_total"],
+                "memory_fact_count_total": (
+                    totals["retained_facts_total"]
+                ),
+                "prompt_has_l1_steps": sum(
+                    bool(row.get("prompt_has_l1")) for row in prompt_rows
+                ),
+                "l1_prompt_built_steps": sum(
+                    bool(row.get("l1_prompt_built")) for row in prompt_rows
+                ),
+                "l1_empty_steps": sum(
+                    not bool(row.get("l1_prompt_built")) for row in prompt_rows
+                ),
                 "l1_enabled_steps": sum(bool(row.get("l1_enabled")) for row in rows),
                 "l1_observation_attempt_steps": len(l1_rows),
                 "l1_observe_error_count": sum(bool(row.get("l1_observe_error")) for row in l1_rows),
+                "l1_selection_error_count": sum(bool(row.get("l1_selection_error")) for row in l1_rows),
                 "l1_detector_error_count": sum(bool(row.get("l1_detector_error")) for row in l1_rows),
+                "l1_events_persisted_total": sum(
+                    int(row.get("l1_events_persisted", 0) or 0) for row in l1_rows
+                ),
+                "l1_detection_events_persisted_total": sum(
+                    int(row.get("l1_detection_events_persisted", 0) or 0)
+                    for row in l1_rows
+                ),
                 "l1_place_attempt_steps": sum(bool(row.get("l1_place_attempted")) for row in l1_rows),
                 "l1_place_observed_steps": sum(bool(row.get("l1_place_observed")) for row in l1_rows),
                 "l1_place_error_count": sum(bool(row.get("l1_place_error")) for row in l1_rows),
@@ -767,6 +1249,92 @@ class UniNaVid_Agent(Agent):
                     for record in row.get("conflict_evidence_ids", [])
                 ],
             })
+            if backend_present:
+                token_rows = [
+                    row for row in prompt_rows if row.get("budget_source")
+                ]
+                token_aware_steps = sum(
+                    row.get("budget_source") == "token_aware_context"
+                    for row in token_rows
+                )
+                fallback_steps = sum(
+                    bool(row.get("budget_fallback_reason"))
+                    for row in token_rows
+                )
+                summary.update({
+                    "l1_token_budget_steps": token_aware_steps,
+                    "l1_token_budget_fallback_steps": fallback_steps,
+                    "budget_source": (
+                        "token_aware_context" if token_aware_steps else
+                        "char_fallback_320" if fallback_steps else None
+                    ),
+                    "budget_fallback_reason": next((
+                        row.get("budget_fallback_reason")
+                        for row in token_rows
+                        if row.get("budget_fallback_reason")
+                    ), None),
+                    "token_overflow_drops_total": sum(
+                        int(row.get("token_overflow_drops", 0) or 0)
+                        for row in token_rows
+                    ),
+                    "memory_budget_violation_steps": sum(
+                        1 for row in token_rows
+                        if row.get("memory_tokens_injected") is not None
+                        and row.get("available_memory_tokens") is not None
+                        and int(row["memory_tokens_injected"])
+                        > int(row["available_memory_tokens"])
+                    ),
+                    "text_prompt_tokens_mean": _mean([
+                        row.get("text_prompt_tokens") for row in token_rows
+                    ]),
+                    "visual_tokens_mean": _mean([
+                        row.get("visual_tokens") for row in token_rows
+                    ]),
+                    "multimodal_prompt_tokens_mean": _mean([
+                        row.get("multimodal_prompt_tokens")
+                        for row in token_rows
+                    ]),
+                    "context_margin_tokens_min": (
+                        min(
+                            int(row["context_margin_tokens"])
+                            for row in token_rows
+                            if row.get("context_margin_tokens") is not None
+                        )
+                        if any(
+                            row.get("context_margin_tokens") is not None
+                            for row in token_rows
+                        ) else None
+                    ),
+                    "multimodal_budget_violation_steps": sum(
+                        1 for row in token_rows
+                        if row.get("multimodal_prompt_tokens") is not None
+                        and row.get("multimodal_prompt_limit_tokens") is not None
+                        and int(row["multimodal_prompt_tokens"])
+                        > int(row["multimodal_prompt_limit_tokens"])
+                    ),
+                    "base_prompt_tokens_mean": _mean([
+                        row.get("base_prompt_tokens") for row in token_rows
+                    ]),
+                    "available_memory_tokens_min": (
+                        min(
+                            int(row["available_memory_tokens"])
+                            for row in token_rows
+                            if row.get("available_memory_tokens") is not None
+                        )
+                        if any(
+                            row.get("available_memory_tokens") is not None
+                            for row in token_rows
+                        ) else None
+                    ),
+                    "memory_tokens_injected_mean": _mean([
+                        row.get("memory_tokens_injected")
+                        for row in token_rows
+                    ]),
+                    "context_limit_tokens": next((
+                        row.get("context_limit_tokens") for row in token_rows
+                        if row.get("context_limit_tokens") is not None
+                    ), None),
+                })
         return summary
 
 
@@ -832,6 +1400,7 @@ class UniNaVid_Agent(Agent):
 
         started = time.perf_counter()
         navigation = self.predict_inference(navigation_qs)
+        self.last_prediction = navigation
         inference_ms = (time.perf_counter() - started) * 1000.0
         self.last_inference_ms = inference_ms
         

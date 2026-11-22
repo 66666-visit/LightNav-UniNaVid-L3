@@ -7,7 +7,7 @@ import numpy as np
 from l1_integration.sbadir_backend import L1EvidenceBackend
 from l1_memory.memory_writer import MockSceneExtractor
 from l3_integration.official_prompt import REFERENCE_OFFICIAL_PROMPT_TEMPLATE
-from l3_integration.sbadir_fusion import compose_sbadir
+from l3_integration.sbadir_fusion import append_original_l1
 from l3_memory.schemas import DetectedObject, SceneExtraction
 from tests.helpers import FakeEpisode, make_sidecar
 
@@ -82,21 +82,19 @@ def test_unique_cross_label_rgb_box_and_l3_mask_exposes_unresolved_conflict():
     b, _ = linked.build_context(instruction, 1)
     assert a.context.text == b.context.text
     selection = l1.select(step=1, rgb_width=8)
-    result = compose_sbadir(
+    assert selection.prompt_text is not None
+    assert selection.prompt_text.startswith("[Navigation Memory]\n")
+    result = append_original_l1(
         template=REFERENCE_OFFICIAL_PROMPT_TEMPLATE,
         instruction=instruction,
-        l3_text=b.context.text,
-        l3_facts=b.selected_facts,
-        l1_facts=selection.selected_facts,
-        entity_links=linked.cross_sensor_links,
+        base_memory_text=b.context.text,
+        l1_text=selection.prompt_text,
         count_tokens=lambda text: len(text.split()),
-        max_prompt_tokens=10000, l1_max_tokens=160,
+        max_prompt_tokens=10000,
     )
-    assert result.diagnostics["conflicting_facts"] == 1
-    assert result.diagnostics["conflicts"][0]["resolution"] == "both_retained"
-    assert "chair" in result.memory_text
-    assert "table" in result.memory_text
-    assert result.diagnostics["l3_core_unchanged"] is True
+    assert result.diagnostics["l1_injected"] is True
+    assert b.context.text in result.memory_text
+    assert selection.prompt_text in result.memory_text
 
 
 def test_cross_label_match_rejects_two_overlapping_detector_boxes():

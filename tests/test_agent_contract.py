@@ -84,7 +84,11 @@ def _fake_agent(agent_module, *, l3=None, predictions=None):
     agent.last_prompt_tokens = None
     agent.last_inference_ms = None
     agent.last_prompt_text = None
+    agent.last_task_text = None
     agent.last_l3_context_text = None
+    agent.last_l1_context_text = None
+    agent.last_l1_prompt_text = None
+    agent.last_sbadir_memory_text = None
     agent.episode_instruction = ""
     agent._steps_stream = None
     agent.tokenizer = SimpleNamespace(

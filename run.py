@@ -172,8 +172,10 @@ def main():
     parser.add_argument("--l1-place-model", type=str, default="")
     parser.add_argument("--l1-place-device", type=str, default="cuda:0")
     parser.add_argument("--l1-place-every-n-steps", type=int, default=5)
-    parser.add_argument("--l1-max-items", type=int, default=3)
-    parser.add_argument("--l1-max-tokens", type=int, default=160)
+    parser.add_argument(
+        "--l1-max-items", type=int, default=2,
+        help="original LightNav Local Graph max_landmarks (fixed at 2)",
+    )
     parser.add_argument(
         "--allow-nonpilot-eval", action="store_true",
         help=(
@@ -274,8 +276,7 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             l1_det_model: str = "", l1_det_device: str = "cuda:0",
             l1_det_confidence: float = 0.25, l1_every_n_steps: int = 5,
             l1_place_model: str = "", l1_place_device: str = "cuda:0",
-            l1_place_every_n_steps: int = 5, l1_max_items: int = 3,
-            l1_max_tokens: int = 160,
+            l1_place_every_n_steps: int = 5, l1_max_items: int = 2,
             allow_nonpilot_eval: bool = False) -> None:
     """Runs experiment given mode and config
 
@@ -514,7 +515,6 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
             "place_device": l1_place_device,
             "place_every_n_steps": l1_place_every_n_steps,
             "max_items": l1_max_items,
-            "max_tokens": l1_max_tokens,
         },
         manifest_audit=manifest_audit,
         episode_order=episode_order,
@@ -556,6 +556,20 @@ def _build_l1_backend(l1_options):
     from l1_integration.sbadir_backend import L1EvidenceBackend
     from l1_memory.place_recognition import DINOv2PlaceDescriptorExtractor
     from l1_memory.yolo_scene_extractor import YOLOSceneExtractor
+
+    # The C group keeps the original LightNav L1 algorithm and parameters;
+    # only the prompt budget is the actual `l1_original_only` token-aware
+    # protocol (320 characters remains the fallback).  Reject a launcher that
+    # would silently change the detector threshold, the 5-step observation
+    # windows, or the two-landmark card.
+    if l1_options["det_confidence"] != 0.25:
+        raise ValueError("original L1 requires detector confidence 0.25")
+    if l1_options["every_n_steps"] != 5:
+        raise ValueError("original L1 requires detector every_n_steps=5")
+    if l1_options["place_every_n_steps"] != 5:
+        raise ValueError("original L1 requires place_every_n_steps=5")
+    if l1_options["max_items"] != 2:
+        raise ValueError("original L1 requires max_landmarks=2")
 
     detector = YOLOSceneExtractor(
         l1_options["det_model"], device=l1_options["det_device"],
@@ -629,7 +643,6 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
             agent = UniNaVid_Agent(
                 model_path, result_path, exp_save, l3_sidecar=l3_sidecar,
                 l1_backend=l1_backend,
-                l1_max_tokens=(l1_options or {}).get("max_tokens", 160),
                 env=env, config=config, experiment_group=experiment_group,
                 source_background=scripted.source_background,
             )
@@ -781,8 +794,26 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
             "place_device": l1_options["place_device"],
             "place_every_n_steps": l1_options["place_every_n_steps"],
             "max_items": l1_options["max_items"],
-            "max_tokens": l1_options["max_tokens"],
-            "fusion": "source_background_augmentation_direct",
+            # The Local Graph builder keeps its native 320-character setting;
+            # the 320 value is also the explicit fallback.  Prompt capacity is
+            # the model-derived token budget below, never an arbitrary larger
+            # character number.
+            "prompt_max_chars": 320,
+            "budget": {
+                "strategy": "token_aware_context",
+                "token_aware": True,
+                "original_char_budget_chars": 320,
+                "generation_reserve": "max_new_tokens",
+                "safety_margin_tokens": 1,
+                "whole_lines_only": True,
+                "visual_token_accounting": (
+                    "online_merge_upper_bound_from_actual_cache"
+                ),
+                "max_landmarks": l1_options["max_items"],
+                "fallback": "original_char_budget_with_reported_reason",
+            },
+            "builder": "local_graph_fusion",
+            "fusion": "original_l1_plus_l3_sbadir",
             "source_tree_sha256": os.environ.get("SBADIR_SOURCE_SHA256"),
         },
     }

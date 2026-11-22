@@ -77,6 +77,7 @@ def _row(key, group, success):
             "l1_observation_attempt_steps": 0,
             "l1_context_tokens_mean": 0.0,
             "l1_observe_error_count": 0,
+            "l1_selection_error_count": 0,
             "l1_detector_error_count": 0,
             "l1_place_attempt_steps": 0,
             "l1_place_observed_steps": 0,
@@ -92,23 +93,34 @@ def _row(key, group, success):
         })
     if group == report.C_GROUP:
         row.update({
-            "source_background_facts_total": 3,
+            "source_background_facts_total": 2,
             "l1_fact_count_total": 1,
             "l1_retained_facts_total": 1,
+            "l1_omitted_facts_total": 0,
+            "l1_prompt_built_steps": 1,
+            "l1_empty_steps": 4,
             "l1_enabled": True,
             "l1_enabled_steps": 5,
             "l1_observation_attempt_steps": 5,
             "l1_context_tokens_mean": 5.0,
             "prompt_has_l1_steps": 1,
+            "l1_events_persisted_total": 5,
+            "l1_detection_events_persisted_total": 2,
             "l1_place_attempt_steps": 1,
             "l1_place_observed_steps": 1,
+            "l1_token_budget_steps": 5,
+            "l1_token_budget_fallback_steps": 0,
+            "token_overflow_drops_total": 0,
+            "memory_budget_violation_steps": 0,
+            "text_prompt_tokens_mean": 90.0,
+            "visual_tokens_mean": 382.0,
+            "multimodal_prompt_tokens_mean": 477.0,
+            "context_margin_tokens_min": 1000,
+            "multimodal_budget_violation_steps": 0,
             "retained_facts_total": 3,
-            "conflicting_facts_total": 1,
-            "conflict_type_counts": {"object_label": 1},
-            "conflict_evidence_ids": [{
-                "l1": ["l1-evidence-" + key[1]],
-                "l3": ["l3-evidence-" + key[1]],
-            }],
+            "conflicting_facts_total": 0,
+            "conflict_type_counts": {"object_label": 0},
+            "conflict_evidence_ids": [],
             "cross_label_entity_links_total": 1,
         })
     return row
@@ -227,8 +239,21 @@ def run_dirs(tmp_path):
             "det_model": "/models/detect.pt", "det_device": "cuda:0",
             "det_confidence": 0.25, "every_n_steps": 5,
             "place_model": "/models/dinov2-small", "place_device": "cuda:0",
-            "place_every_n_steps": 5, "max_items": 3, "max_tokens": 160,
-            "fusion": "source_background_augmentation_direct",
+            "place_every_n_steps": 5, "max_items": 2,
+            "prompt_max_chars": 320,
+            "budget": {
+                "strategy": "token_aware_context", "token_aware": True,
+                "original_char_budget_chars": 320,
+                "generation_reserve": "max_new_tokens",
+                "safety_margin_tokens": 1, "whole_lines_only": True,
+                "visual_token_accounting": (
+                    "online_merge_upper_bound_from_actual_cache"
+                ),
+                "max_landmarks": 2,
+                "fallback": "original_char_budget_with_reported_reason",
+            },
+            "builder": "local_graph_fusion",
+            "fusion": "original_l1_plus_l3_sbadir",
             "source_tree_sha256": source_digest,
         },
     })
@@ -305,9 +330,10 @@ def test_report_pairs_three_groups_by_episode_identity(run_dirs):
     assert summary["integrity"]["c_adds_l1_to_b"] is True
     assert summary["integrity"]["c_keeps_b_source_background"] is True
     assert summary["integrity"]["b_c_l3_background_equal_on_common_prefix"] is True
-    assert summary["conflict_evidence_ids"] == [
-        "l1-evidence-1", "l1-evidence-2", "l3-evidence-1", "l3-evidence-2",
-    ]
+    # C no longer runs cross-layer L1/L3 conflict fusion: the original L1
+    # card is appended verbatim and SBAdir source pairing is L3-only.
+    assert summary["conflict_evidence_ids"] == []
+    assert summary["groups"][report.C_NAME]["conflicting_facts_total"] == 0
     assert len((output / "paired_episode_deltas.csv").read_text().splitlines()) == 3
     assert len((output / "results.jsonl").read_text().splitlines()) == 6
     assert len((output / "comparison.csv").read_text().splitlines()) == (
@@ -468,3 +494,91 @@ def test_l3_state_ignores_l1_dependent_fields_only():
     assert report._l3_state(base)["fact_count"] == 1
     changed = dict(base, object_nodes=2)
     assert report._l3_state(base) != report._l3_state(changed)
+
+
+def test_report_accepts_a_c_episode_with_no_l1_fact(run_dirs):
+    # A single C Episode may legitimately have no original L1 card.  The
+    # report must not turn that into a run-wide failure; the other Episode
+    # still proves that C adds L1 somewhere.
+    _baseline, _source, fused, _launch, _output = run_dirs
+    rows = [json.loads(line) for line in
+            (fused / "results.jsonl").read_text().splitlines()]
+    for row in rows:
+        if row.get("group") == report.C_GROUP:
+            row.update({
+                "l1_fact_count_total": 0,
+                "l1_retained_facts_total": 0,
+                "l1_omitted_facts_total": 0,
+                "l1_prompt_built_steps": 0,
+                "l1_empty_steps": row.get("env_steps", 5),
+                "prompt_has_l1_steps": 0,
+                "l1_context_tokens_mean": 0.0,
+                "retained_facts_total": row.get("l3_fact_count_total", 0),
+            })
+            break
+    _write_jsonl(fused / "results.jsonl", rows)
+    summary = _build(run_dirs)
+    assert summary["integrity"]["c_adds_l1_to_b"] is True
+
+
+def test_step_audit_accepts_token_aware_l1_above_320_but_not_fallback(tmp_path):
+    l1 = "[Navigation Memory]\n" + ("Current RGB: instruction landmark chair. " * 12)
+    assert len(l1) > 320
+    row = {
+        "step": 0,
+        "prompt_has_l1": True,
+        "l1_context_text": l1,
+        "prompt_text": "instruction\n" + l1,
+        "l1_prompt_chars": len(l1),
+        "l1_prompt_sha256": hashlib.sha256(l1.encode("utf-8")).hexdigest(),
+        "l1_budget_chars": 320,
+        "budget_source": "token_aware_context",
+        "available_memory_tokens": 500,
+        "memory_tokens_injected": 250,
+    }
+    path = tmp_path / "steps.jsonl"
+    _write_jsonl(path, [row])
+    audit = report._step_audit(path)
+    assert audit["l1_prompt_steps_checked"] == 1
+
+    row["budget_source"] = "char_fallback_320"
+    _write_jsonl(path, [row])
+    with pytest.raises(ValueError, match="fallback card exceeds"):
+        report._step_audit(path)
+
+
+def test_report_rejects_c_without_the_token_budget_protocol(run_dirs):
+    _baseline, _source, fused, _launch, output = run_dirs
+    config = json.loads((fused / "run_config.json").read_text())
+    config["l1"].pop("budget")
+    _write_json(fused / "run_config.json", config)
+    with pytest.raises(ValueError, match="lacks the token-budget protocol"):
+        _build(run_dirs)
+    assert not (output / "summary.json").exists()
+
+
+def test_step_audit_rejects_multimodal_prompt_over_context_reserve(tmp_path):
+    l1 = "[Navigation Memory]\nCurrent RGB: instruction landmark chair."
+    row = {
+        "step": 0,
+        "prompt_has_l1": True,
+        "l1_context_text": l1,
+        "prompt_text": "instruction\n" + l1,
+        "l1_prompt_chars": len(l1),
+        "l1_prompt_sha256": hashlib.sha256(l1.encode("utf-8")).hexdigest(),
+        "l1_budget_chars": 320,
+        "budget_source": "token_aware_context",
+        "available_memory_tokens": 500,
+        "memory_tokens_injected": 10,
+        "text_prompt_tokens": 100,
+        "visual_tokens": 400,
+        "base_prompt_tokens": 500,
+        "multimodal_prompt_limit_tokens": 505,
+        "multimodal_prompt_tokens": 510,
+        "context_margin_tokens": -5,
+        "multimodal_budget_overflow": True,
+    }
+    path = tmp_path / "steps.jsonl"
+    _write_jsonl(path, [row])
+    with pytest.raises(ValueError, match="multimodal prompt exceeds|overflow flag"):
+        report._step_audit(path)

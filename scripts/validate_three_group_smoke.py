@@ -74,21 +74,77 @@ def _validate_c(row: dict) -> None:
         raise ValueError("C smoke did not enable L1")
     if row.get("l1_enabled_steps", 0) != row.get("env_steps"):
         raise ValueError("C smoke did not run L1 on every step")
-    if row.get("l1_fact_count_total", 0) <= 0:
-        raise ValueError("C smoke produced no L1 fact; choose another SMOKE_SHARD")
-    if row.get("source_background_facts_total") != (
-            row.get("l3_fact_count_total", 0) + row.get("l1_fact_count_total", 0)):
-        raise ValueError("C smoke did not pair every retained fact with its source")
+    # LightNav's original LocalGraphFusion legitimately produces no card on
+    # steps without a current instruction-relevant detection or history.  A
+    # single Smoke Episode therefore may contain zero L1 facts.  That is not a
+    # Smoke failure as long as the L1 chain ran and no error was recorded.
+    l1_facts = int(row.get("l1_fact_count_total", 0) or 0)
+    l1_retained = int(row.get("l1_retained_facts_total", 0) or 0)
+    l1_built = int(row.get("l1_prompt_built_steps", 0) or 0)
+    l1_prompt_steps = int(row.get("prompt_has_l1_steps", 0) or 0)
+    if l1_facts == 0:
+        if l1_retained or l1_built or l1_prompt_steps:
+            raise ValueError(
+                "C smoke built/injected an L1 card without an L1 fact"
+            )
+    else:
+        if l1_built <= 0:
+            raise ValueError(
+                "C smoke produced L1 facts but never built the original L1 card"
+            )
+        if l1_retained <= 0:
+            raise ValueError(
+                "C smoke selected L1 facts but did not inject them verbatim"
+            )
+        if l1_prompt_steps <= 0:
+            raise ValueError(
+                "C smoke selected L1 facts but no prompt step contains the L1 card"
+            )
+    # C's SBAdir source background is attached to B's frozen L3 facts only.
+    # The original L1 card is injected verbatim and has no source suffix.
+    if row.get("source_background_facts_total") != row.get("l3_fact_count_total", 0):
+        raise ValueError("C smoke did not pair every L3 fact with its source")
     if row.get("l3_original_memory_unchanged") is not True:
         raise ValueError("C smoke altered the original L3 memory")
-    for key in ("l1_observe_error_count", "l1_detector_error_count",
+    for key in ("l1_observe_error_count", "l1_selection_error_count",
+                "l1_detector_error_count",
                 "l1_place_error_count", "l3_segmentation_error_count",
                 "cross_label_entity_link_error_count"):
         if row.get(key, 0) != 0:
             raise ValueError("C smoke encountered {}".format(key))
+    budget_source = row.get("budget_source")
+    if l1_prompt_steps > 0:
+        if budget_source == "token_aware_context":
+            base_tokens = row.get("base_prompt_tokens_mean")
+            available = row.get("available_memory_tokens_min")
+            injected = row.get("memory_tokens_injected_mean")
+            if not isinstance(base_tokens, (int, float)) or base_tokens <= 0:
+                raise ValueError("C smoke lacks a measured base prompt token count")
+            if not isinstance(available, int) or available < 0:
+                raise ValueError("C smoke lacks the measured L1 token budget")
+            if not isinstance(injected, (int, float)) or injected < 0:
+                raise ValueError("C smoke lacks the injected L1 token count")
+            if row.get("memory_budget_violation_steps", 0) != 0:
+                raise ValueError("C smoke injected more L1 tokens than the budget")
+            visual = row.get("visual_tokens_mean")
+            if not isinstance(visual, (int, float)) or visual < 0:
+                raise ValueError("C smoke lacks a visual-token count")
+            margin = row.get("context_margin_tokens_min")
+            if not isinstance(margin, int) or margin < 0:
+                raise ValueError("C smoke multimodal prompt exceeds context reserve")
+            if row.get("multimodal_budget_violation_steps", 0) != 0:
+                raise ValueError("C smoke exceeded the multimodal context reserve")
+        elif budget_source == "char_fallback_320":
+            if not row.get("budget_fallback_reason"):
+                raise ValueError("C L1 char fallback lacks a reported reason")
+        else:
+            raise ValueError("C smoke lacks the L1 token-budget protocol")
+    drops = row.get("token_overflow_drops", 0)
+    if not isinstance(drops, int) or drops < 0:
+        raise ValueError("C smoke has an invalid token overflow count")
     for key in ("l3_map_steps", "l3_fact_count_total", "prompt_has_l3_steps",
-                "prompt_has_l1_steps", "l1_place_attempt_steps",
-                "l1_place_observed_steps"):
+                "l1_place_attempt_steps", "l1_place_observed_steps",
+                "l1_events_persisted_total"):
         if row.get(key, 0) <= 0:
             raise ValueError(
                 "C smoke did not exercise {}; choose another SMOKE_SHARD".format(key)
@@ -122,11 +178,22 @@ C_KEYS = ("l3_enabled", "env_steps", "l3_map_steps", "l3_fact_count_total",
           "prompt_has_l3_steps", "prompt_has_l1_steps",
           "source_background_facts_total", "l3_original_memory_unchanged",
           "source_background_enabled", "l1_enabled", "l1_enabled_steps",
-          "l1_fact_count_total", "l1_observation_attempt_steps",
+          "l1_fact_count_total", "l1_retained_facts_total",
+          "l1_omitted_facts_total", "l1_prompt_built_steps", "l1_empty_steps",
+          "l1_observation_attempt_steps", "l1_events_persisted_total",
+          "l1_detection_events_persisted_total",
           "l1_place_attempt_steps", "l1_place_observed_steps",
-          "l1_observe_error_count", "l1_detector_error_count",
+          "l1_observe_error_count", "l1_selection_error_count",
+          "l1_detector_error_count",
           "l1_place_error_count", "l3_segmentation_error_count",
-          "cross_label_entity_link_error_count")
+          "cross_label_entity_link_error_count", "budget_source",
+          "context_limit_tokens", "base_prompt_tokens",
+          "available_memory_tokens", "memory_tokens_injected",
+          "token_overflow_drops", "budget_fallback_reason",
+          "memory_budget_violation_steps",
+          "text_prompt_tokens_mean", "visual_tokens_mean",
+          "multimodal_prompt_tokens_mean", "context_margin_tokens_min",
+          "multimodal_budget_violation_steps")
 
 
 def validate(a_dir, b_dir, c_dir, a_group: str, b_group: str, c_group: str) -> dict:

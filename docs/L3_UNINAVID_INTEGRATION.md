@@ -243,13 +243,14 @@ No L1 prompt module is vendored.
 L1 isolation is enforced at three levels:
 
 - `make_spatial_evidence(instances, [], store, ...)` is always called with an
-  empty L1 event list; every minted L3 evidence record has
-  `linked_l1_evidence_id=None`;
-- no `L1PromptOrganizer`, `LocalGraphFusion`, `JointPromptBuilder`,
-  `l1_prompt_organizer`, `joint_prompt` import/call exists in
-  `l3_integration/`, `l3_memory/` or `agent_uninavid.py` (static test);
-- the L3 serializer receives `object_map` and `V3MemoryStore` only; there is no
-  L1 `MemoryContext` input.
+  empty L1 event list in the A/B L3-only path; every minted L3 evidence record
+  has `linked_l1_evidence_id=None`;
+- no L1 prompt builder import/call exists in `l3_integration/` or
+  `l3_memory/` (static test); C's L1 adapter lives in `l1_integration/` and
+  is only invoked from `agent_uninavid.py` when the C group supplies it;
+- the L3 serializer receives `object_map` and `V3MemoryStore` only; the C L1
+  block is appended after the L3+source-background block, never passed into
+  the L3 map or L3 serializer.
 
 Map construction input is current `obs["rgb"]`, aligned `obs["depth"]`, current
 agent/sensor pose and pinhole calibration. No top-down map, shortest path,

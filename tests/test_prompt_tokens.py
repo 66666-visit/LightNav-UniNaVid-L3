@@ -409,3 +409,15 @@ def test_real_l3_sidecar_reaches_the_real_agent_prompt(monkeypatch):
         assert first_prompt is not None
         assert agent.model.captured["input_ids"] is not None
         assert agent.model.captured["images"] == ["VISION_FEATURE_TENSOR"]
+
+
+def test_l1_budget_counter_matches_the_exact_official_token_stream(monkeypatch):
+    """C's budget must count the same stream predict_inference builds."""
+    with agent_module_stubs() as agent_module:
+        monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *a, **k: self)
+        agent = _agent(agent_module, monkeypatch)
+        prompt = build_official_prompt(
+            REFERENCE_OFFICIAL_PROMPT_TEMPLATE, "find the chair",
+        )
+        expected = _official_input_ids(prompt, agent.tokenizer)
+        assert agent._count_prompt_tokens(prompt) == expected.shape[1]

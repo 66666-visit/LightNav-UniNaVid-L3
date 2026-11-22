@@ -33,8 +33,7 @@ L1_PLACE_DEVICE="${L1_PLACE_DEVICE:-cuda:0}"
 L1_DET_CONFIDENCE="${L1_DET_CONFIDENCE:-0.25}"
 L1_EVERY_N_STEPS="${L1_EVERY_N_STEPS:-5}"
 L1_PLACE_EVERY_N_STEPS="${L1_PLACE_EVERY_N_STEPS:-5}"
-L1_MAX_ITEMS="${L1_MAX_ITEMS:-3}"
-L1_MAX_TOKENS="${L1_MAX_TOKENS:-160}"
+L1_MAX_ITEMS="${L1_MAX_ITEMS:-2}"
 SMOKE_SHARD="${SMOKE_SHARD:-0}"
 CONFIRM="${CONFIRM:-NO}"
 
@@ -265,7 +264,7 @@ C_ONLY=(--l1-det-model "$L1_DET_MODEL" --l1-det-device "$L1_DET_DEVICE"
     --l1-every-n-steps "$L1_EVERY_N_STEPS"
     --l1-place-model "$L1_PLACE_MODEL" --l1-place-device "$L1_PLACE_DEVICE"
     --l1-place-every-n-steps "$L1_PLACE_EVERY_N_STEPS"
-    --l1-max-items "$L1_MAX_ITEMS" --l1-max-tokens "$L1_MAX_TOKENS")
+    --l1-max-items "$L1_MAX_ITEMS")
 
 info "A: $BASELINE_WORKTREE at $BASELINE_SHA (untouched 7602b25, L3 only)"
 info "B: $REPO_ROOT at $(git -C "$REPO_ROOT" rev-parse HEAD) (L3 + source background, no L1)"

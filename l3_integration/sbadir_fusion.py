@@ -221,7 +221,7 @@ def compose_sbadir(
     l1_facts: Sequence[Any],
     count_tokens: Callable[[str], int],
     max_prompt_tokens: int,
-    l1_max_tokens: int,
+    l1_max_tokens: int = 0,
     entity_links: Optional[Mapping[str, str]] = None,
 ) -> FusionResult:
     """Preserve all L3 core lines, then spend remaining tokens on L1 facts.
@@ -235,8 +235,13 @@ def compose_sbadir(
         raise ValueError("instruction must be text")
     if type(max_prompt_tokens) is not int or max_prompt_tokens <= 0:
         raise ValueError("a measured positive prompt token capacity is required")
-    if type(l1_max_tokens) is not int or l1_max_tokens < 0:
-        raise ValueError("l1_max_tokens must be a nonnegative integer")
+    if l1_facts:
+        # C must not route its original Local Graph card through SBAdir.  The
+        # per-fact L1 fusion path is retained only as historical B-module code
+        # and is disabled here so it cannot be reattached accidentally.
+        raise ValueError(
+            "SBAdir L1 fact fusion is disabled; C appends the original L1 card"
+        )
     original = l3_text if isinstance(l3_text, str) and l3_text.strip() else None
     core = build_task_text(instruction, original)
     core_tokens = int(count_tokens(build_prompt(template, core)))
@@ -362,3 +367,166 @@ def compose_sbadir(
     return FusionResult(final_task, final_memory, original,
                         "\n".join(l1_lines) or None, diagnostics,
                         l3_enriched_text)
+
+
+#: The LightNav 75% Local Graph card budget.  The L1 block is built and bounded
+#: by the original Local Graph builder/``build_context_text`` with exactly this value; the
+#: C group does not lift it or replace it with a token-derived L1 budget.
+ORIGINAL_L1_PROMPT_MAX_CHARS = 320
+ORIGINAL_L1_HEADER = "[Navigation Memory]"
+
+
+@dataclass
+class OriginalL1Result:
+    """Result of appending a verbatim original Local Graph card to B's task text."""
+
+    task_text: str
+    memory_text: Optional[str]
+    l1_text: Optional[str]
+    diagnostics: dict[str, Any]
+
+
+def append_original_l1(
+    *,
+    template: str,
+    instruction: str,
+    base_memory_text: Optional[str],
+    l1_text: Optional[str],
+    count_tokens: Optional[Callable[[str], int]] = None,
+    max_prompt_tokens: Optional[int] = None,
+    char_budget: Optional[int] = ORIGINAL_L1_PROMPT_MAX_CHARS,
+    token_aware: bool = False,
+) -> OriginalL1Result:
+    """Append the already-selected original L1 card after B's task text.
+
+    This is intentionally not a fusion.  The C adapter selects whole L1 lines
+    against the measured token budget before calling this function; this
+    function only inserts the resulting card byte-for-byte after the frozen
+    L3+source-background block, or omits it as a whole when it does not fit the
+    exact prompt capacity.  It never rewrites an L1 line, never attaches an L1
+    source background, and never cuts a line.
+
+    ``char_budget`` is the original 320-character fallback.  It is ``None``
+    only when a measured token budget owns selection; it is never replaced by
+    an arbitrary larger character number.
+    """
+    if not isinstance(instruction, str):
+        raise ValueError("instruction must be text")
+    if max_prompt_tokens is not None and (
+        type(max_prompt_tokens) is not int or max_prompt_tokens <= 0
+    ):
+        raise ValueError("a measured positive prompt token capacity is required")
+    if count_tokens is not None and not callable(count_tokens):
+        raise ValueError("count_tokens must be callable or None")
+    if char_budget is not None and (
+        type(char_budget) is not int or char_budget < 1
+    ):
+        raise ValueError("char_budget must be a positive integer or None")
+    base = base_memory_text if isinstance(base_memory_text, str) and base_memory_text.strip() else None
+    if l1_text is None or not isinstance(l1_text, str) or not l1_text.strip():
+        diagnostics = {
+            "l1_present": False,
+            "l1_injected": False,
+            "l1_chars": 0,
+            "l1_sha256": None,
+            "l1_token_count": 0,
+            "empty_reason": "no_original_l1_card",
+            "char_budget": char_budget,
+        }
+        if token_aware:
+            diagnostics.update({
+                "token_overflow_drops": 0,
+                "budget_source": "token_aware_context",
+            })
+        return OriginalL1Result(
+            task_text=build_task_text(instruction, base),
+            memory_text=base,
+            l1_text=None,
+            diagnostics=diagnostics,
+        )
+    if char_budget is not None and len(l1_text) > char_budget:
+        raise ValueError(
+            "original L1 card exceeds its {}-character budget: {}".format(
+                char_budget, len(l1_text),
+            )
+        )
+    if not l1_text.startswith(ORIGINAL_L1_HEADER + "\n"):
+        raise ValueError("original L1 card lacks the Local Graph header")
+    combined = l1_text if base is None else base + "\n" + l1_text
+    candidate_task = build_task_text(instruction, combined)
+    base_task = build_task_text(instruction, base)
+    candidate_tokens = None
+    base_tokens = None
+    measured = count_tokens is not None and max_prompt_tokens is not None
+    if measured:
+        try:
+            candidate_tokens = int(count_tokens(build_prompt(template, candidate_task)))
+            base_tokens = int(count_tokens(build_prompt(template, base_task)))
+        except Exception as exc:  # noqa: BLE001 - do not guess a capacity
+            return OriginalL1Result(
+                task_text=base_task,
+                memory_text=base,
+                l1_text=None,
+                diagnostics={
+                    "l1_present": True,
+                    "l1_injected": False,
+                    "l1_chars": len(l1_text),
+                    "l1_sha256": hashlib.sha256(l1_text.encode("utf-8")).hexdigest(),
+                    "l1_token_count": None,
+                    "token_overflow_drops": len(l1_text.splitlines()),
+                    "empty_reason": "prompt_measurement_failed: {}: {}".format(
+                        type(exc).__name__, exc,
+                    ),
+                    "char_budget": char_budget,
+                    "budget_source": (
+                        "token_aware_context" if token_aware else "char_fallback_320"
+                    ),
+                },
+            )
+        if candidate_tokens > max_prompt_tokens:
+            return OriginalL1Result(
+                task_text=base_task,
+                memory_text=base,
+                l1_text=None,
+                diagnostics={
+                    "l1_present": True,
+                    "l1_injected": False,
+                    "l1_chars": len(l1_text),
+                    "l1_sha256": hashlib.sha256(l1_text.encode("utf-8")).hexdigest(),
+                    "l1_token_count": 0,
+                    "token_overflow_drops": len(l1_text.splitlines()),
+                    "empty_reason": "measured_prompt_capacity",
+                    "char_budget": char_budget,
+                    "budget_source": (
+                        "token_aware_context" if token_aware else "char_fallback_320"
+                    ),
+                    "base_prompt_tokens": base_tokens,
+                    "final_prompt_tokens": base_tokens,
+                    "max_prompt_tokens": max_prompt_tokens,
+                },
+            )
+    if l1_text not in candidate_task:
+        raise AssertionError("original L1 card was not inserted verbatim")
+    return OriginalL1Result(
+        task_text=candidate_task,
+        memory_text=combined,
+        l1_text=l1_text,
+        diagnostics={
+            "l1_present": True,
+            "l1_injected": True,
+            "l1_chars": len(l1_text),
+            "l1_sha256": hashlib.sha256(l1_text.encode("utf-8")).hexdigest(),
+            "l1_token_count": (
+                candidate_tokens - base_tokens if measured else None
+            ),
+            "token_overflow_drops": 0,
+            "empty_reason": None,
+            "char_budget": char_budget,
+            "budget_source": (
+                "token_aware_context" if token_aware else "char_fallback_320"
+            ),
+            "base_prompt_tokens": base_tokens,
+            "final_prompt_tokens": candidate_tokens,
+            "max_prompt_tokens": max_prompt_tokens,
+        },
+    )
