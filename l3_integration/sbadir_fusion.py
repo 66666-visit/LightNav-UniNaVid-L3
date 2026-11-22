@@ -9,6 +9,7 @@ formatted only once.  L3's original context is produced by the unchanged
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
@@ -80,64 +81,83 @@ def _matched_l3(
 
 
 def _background(fact: Any, layer: str) -> str:
+    """Pair one fact with the real source fields of its own observation.
+
+    Only fields that exist on the selected evidence are printed.  A required
+    field that is absent is written as ``unavailable`` instead of being
+    silently dropped or guessed; no field is a sensor trust score.
+    """
     evidence = _ids(fact)
     source_records = tuple(getattr(fact, "evidence", ()) or ())
     latest_record = source_records[0] if source_records else None
-    source = _one_line(
-        getattr(latest_record, "detector_name", None)
-        or getattr(fact, "source", "")
-    )
-    step = (
-        getattr(latest_record, "observation_step", None)
-        if layer == "L1" and latest_record is not None else
-        getattr(fact, "latest_step", None) if layer == "L3" else
-        getattr(fact, "last_step", None)
-    )
+    if layer == "L1" and latest_record is not None:
+        source = getattr(latest_record, "detector_name", None) or getattr(
+            fact, "source", "")
+        step = getattr(latest_record, "observation_step", None)
+        confidence = getattr(latest_record, "detection_confidence", None)
+        # L1's selected records put the current/latest observation first, so
+        # the printed source, step and confidence belong to this evidence ID.
+        primary_evidence = getattr(latest_record, "evidence_id", None)
+    else:
+        source = getattr(fact, "source", "")
+        step = getattr(fact, "latest_step", None)
+        confidence = getattr(fact, "confidence", None)
+        # L3's evidence IDs are chronological; pair the newest one with the
+        # printed latest step and latest segmentation confidence.
+        primary_evidence = evidence[-1] if evidence else None
+
     parts = ["L3 RGB-D map" if layer == "L3" else "L1 RGB observation"]
-    if source:
-        parts.append("source " + source)
+    cleaned_source = _one_line(source) if source else ""
+    parts.append("source " + (cleaned_source or "unavailable"))
     if layer == "L1" and latest_record is not None:
         rgb_source = getattr(latest_record, "rgb_observation_source", None)
-        if rgb_source:
-            parts.append("RGB input " + _one_line(rgb_source))
+        parts.append("RGB input " + (
+            _one_line(rgb_source) if rgb_source else "unavailable"))
     if layer == "L3":
         node = getattr(fact, "object_id", None)
-        if node:
-            parts.append("map node " + _one_line(node))
-        if getattr(fact, "geometry_verified", False):
-            parts.append("geometry observed")
+        parts.append("map node " + (
+            _one_line(node) if node else "unavailable"))
+        parts.append(
+            "geometry observed" if getattr(fact, "geometry_verified", False)
+            else "geometry unverified"
+        )
     if type(step) is int and step >= 0:
         parts.append("step " + str(step))
-    confidence = (
-        getattr(latest_record, "detection_confidence", None)
-        if layer == "L1" and latest_record is not None
-        else getattr(fact, "confidence", None)
-    )
+    else:
+        parts.append("step unavailable")
     if isinstance(confidence, (int, float)) and math.isfinite(float(confidence)):
-        parts.append(("seg" if layer == "L3" else "detector") + " conf " + format(float(confidence), ".2f"))
-    primary_evidence = (
-        getattr(latest_record, "evidence_id", None)
-        if layer == "L1" and latest_record is not None else
-        evidence[-1] if layer == "L3" and evidence else
-        evidence[0] if evidence else None
-    )
-    if primary_evidence:
-        # L3's evidence IDs are chronological, while L1's selected records
-        # put the current/latest observation first.  Match the printed step,
-        # source and confidence to the ID from that same observation.
-        parts.append("evidence " + _one_line(primary_evidence))
+        parts.append(
+            ("seg" if layer == "L3" else "detector") + " conf "
+            + format(float(confidence), ".2f")
+        )
+    else:
+        parts.append(("seg" if layer == "L3" else "detector") + " conf unavailable")
+    parts.append("evidence " + (
+        _one_line(primary_evidence) if primary_evidence else "unavailable"))
     if layer == "L1":
         place_source = getattr(fact, "visual_place_source", None)
         place_evidence = tuple(getattr(fact, "visual_place_evidence_ids", ()) or ())
-        if place_source and place_evidence:
-            parts.append("visual place source " + _one_line(place_source))
-            parts.append("visual place evidence " + _one_line(place_evidence[-1]))
+        if getattr(fact, "visual_place_id", None) or place_source or place_evidence:
+            parts.append("visual place source " + (
+                _one_line(place_source) if place_source else "unavailable"))
+            parts.append("visual place evidence " + (
+                _one_line(place_evidence[-1]) if place_evidence else "unavailable"))
     return " [" + "; ".join(parts) + "]"
 
 
-def _l1_line(fact: Any, match: Optional[Any]) -> str:
+def _l1_line(fact: Any, match: Optional[Any], relation: str) -> str:
     if match is None:
         return "L1 RGB fact: " + _fact_line(fact)
+    if relation == "conflict":
+        # Both observations are kept verbatim.  The shared map entity and the
+        # L3 value are named so the model can see the disagreement; neither
+        # side is declared correct and no value is rewritten.
+        return (
+            "L1 RGB fact: " + _fact_line(fact)
+            + "; same map entity " + _one_line(match.object_id)
+            + "; L3 reports " + _one_line(match.label)
+            + "; both retained"
+        )
     # The shared object-label assertion is stated by the L3 line already.
     # Preserve the remaining L1 observation attributes and their provenance.
     role = getattr(fact, "role", None)
@@ -160,6 +180,28 @@ def _l1_line(fact: Any, match: Optional[Any]) -> str:
     return "; ".join(parts) + "."
 
 
+def _relation(fact: Any, match: Optional[Any]) -> str:
+    """Classify one retained L1 fact against its verified L3 map entity."""
+    if match is None:
+        return "no_match"
+    l1_claim = Claim(str(match.object_id), "object_label", _label(fact), "L1", _ids(fact))
+    l3_claim = Claim(str(match.object_id), "object_label", _label(match), "L3", _ids(match))
+    return classify_claims(l1_claim, l3_claim)
+
+
+def _fact_identities(facts: Sequence[Any]) -> list[dict[str, Any]]:
+    """Serializable identity of each selected fact, without its provenance."""
+    return [
+        {
+            "object_id": getattr(fact, "object_id", None),
+            "label": _one_line(getattr(fact, "label", "")),
+            "evidence_ids": list(_ids(fact)),
+            "line": _fact_line(fact),
+        }
+        for fact in facts
+    ]
+
+
 @dataclass
 class FusionResult:
     task_text: str
@@ -167,6 +209,7 @@ class FusionResult:
     l3_original_text: Optional[str]
     l1_text: Optional[str]
     diagnostics: dict[str, Any]
+    l3_enriched_text: Optional[str] = None
 
 
 def compose_sbadir(
@@ -230,14 +273,12 @@ def compose_sbadir(
     l1_retained = 0
     l1_omitted = 0
     l1_retained_evidence: list[list[str]] = []
-    retained_pairs: list[tuple[Any, Optional[Any]]] = []
+    retained_pairs: list[tuple[Any, Optional[Any], str]] = []
     for fact in l1_facts:
         match = _matched_l3(fact, selected_l3, entity_links)
+        relation = _relation(fact, match)
         # Keep both original values if the linked evidence disagrees.
-        if match is not None and _label(fact) != _label(match):
-            line = "L1 RGB fact: " + _fact_line(fact)
-        else:
-            line = _l1_line(fact, match)
+        line = _l1_line(fact, match, relation)
         line += _background(fact, "L1")
         candidate_lines = l1_lines + [line]
         candidate_memory = "\n".join([*enriched, *candidate_lines])
@@ -249,29 +290,26 @@ def compose_sbadir(
             current_task = candidate_task
             l1_retained += 1
             l1_retained_evidence.append(list(_ids(fact)))
-            retained_pairs.append((fact, match))
+            retained_pairs.append((fact, match, relation))
         else:
             l1_omitted += 1
 
     duplicate_count = 0
     conflict_records: list[dict[str, Any]] = []
     uncertain_count = 0
-    for fact, match in retained_pairs:
+    for fact, match, relation in retained_pairs:
         if match is None:
             if any(_label(fact) == _label(item) for item in selected_l3):
                 uncertain_count += 1
             continue
-        l1_claim = Claim(str(match.object_id), "object_label", _label(fact), "L1", _ids(fact))
-        l3_claim = Claim(str(match.object_id), "object_label", _label(match), "L3", _ids(match))
-        relation = classify_claims(l1_claim, l3_claim)
         if relation == "duplicate":
             duplicate_count += 1
         elif relation == "conflict":
             conflict_records.append({
                 "type": "object_label", "entity_id": str(match.object_id),
-                "l1_value": l1_claim.value, "l3_value": l3_claim.value,
-                "l1_evidence_ids": list(l1_claim.evidence_ids),
-                "l3_evidence_ids": list(l3_claim.evidence_ids),
+                "l1_value": _label(fact), "l3_value": _label(match),
+                "l1_evidence_ids": list(_ids(fact)),
+                "l3_evidence_ids": list(_ids(match)),
                 "resolution": "both_retained",
             })
 
@@ -285,6 +323,8 @@ def compose_sbadir(
     l3_core_unchanged = all(
         enriched[index].startswith(line) for index, line in enumerate(lines)
     )
+    l3_enriched_text = "\n".join(enriched) if enriched else None
+    fact_identities = _fact_identities(selected_l3)
     diagnostics = {
         "l3_fact_count": len(selected_l3),
         "l1_fact_count": len(l1_facts),
@@ -304,6 +344,15 @@ def compose_sbadir(
         "max_prompt_tokens": max_prompt_tokens,
         "l1_max_tokens": l1_max_tokens,
         "l3_original_sha256": hashlib.sha256((original or "").encode("utf-8")).hexdigest(),
+        # Source background is built only from the selected fact records, so
+        # equal facts produce an equal enriched L3 block (B vs C check).
+        "l3_enriched_sha256": hashlib.sha256(
+            (l3_enriched_text or "").encode("utf-8")
+        ).hexdigest(),
+        "l3_fact_signature_sha256": hashlib.sha256(json.dumps(
+            fact_identities, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")).hexdigest(),
         "l3_core_unchanged": l3_core_unchanged,
         "conflicts": conflict_records,
         "l1_evidence_ids": [list(_ids(fact)) for fact in l1_facts],
@@ -311,4 +360,5 @@ def compose_sbadir(
         "l3_evidence_ids": [list(_ids(fact)) for fact in selected_l3],
     }
     return FusionResult(final_task, final_memory, original,
-                        "\n".join(l1_lines) or None, diagnostics)
+                        "\n".join(l1_lines) or None, diagnostics,
+                        l3_enriched_text)

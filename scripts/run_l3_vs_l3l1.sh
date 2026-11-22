@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Run the protected 7602b25 L3 baseline and the L3+L1 SBAdir branch in order.
+# Run the three frozen L3 comparison groups in order:
+#   A l3_organized_baseline_7602b25        exact 7602b25 worktree, L3 only
+#   B l3_sbadir_source_background_only     same L3 facts + real source fields
+#   C l3_l1_sbadir                         B + L1 RGB memory, same fusion
+# Each group runs one real Episode smoke first; only after all three smokes
+# pass does the launcher start the formal 88-Episode runs (A, then B, then C).
 # CONFIRM=YES is required for real Habitat/GPU work. Dry runs create no output.
 set -euo pipefail
 
@@ -45,7 +50,14 @@ PILOT_SHA="cf1755261b5d5bba6910e74b47e52cc2d6506a3e2edd79fa0012e691f6c7a04a"
 EPISODE_SHA="30260e81e98a0f368cc214b095d9f1c4c43a65e7332e2dc6d7f89e80ae9eac98"
 PROMPT_SHA="435d79868156aaa1352afcd98f4ceae2f03a54f8cdc5fe87e41d32774d5512c1"
 A_NAME="l3_organized_baseline_7602b25"
-B_NAME="l3_l1_sbadir"
+B_NAME="l3_sbadir_source_background_only"
+C_NAME="l3_l1_sbadir"
+A_GROUP="uninavid_l3_only"
+B_GROUP="uninavid_l3_source_background"
+C_GROUP="uninavid_l3_l1_sbadir"
+A_SMOKE="smoke_${A_NAME}"
+B_SMOKE="smoke_${B_NAME}"
+C_SMOKE="smoke_${C_NAME}"
 
 die() { echo "[l3-vs-l3l1] ERROR: $*" >&2; exit 1; }
 info() { echo "[l3-vs-l3l1] $*"; }
@@ -65,14 +77,14 @@ case "$SMOKE_SHARD" in ''|*[!0-9]*) die "SMOKE_SHARD must be an integer in 0..87
     || die "SMOKE_SHARD must be in 0..87"
 require_dir "$BASELINE_WORKTREE"
 BASELINE_WORKTREE="$(absolute "$BASELINE_WORKTREE")"
-[ "$BASELINE_WORKTREE" != "$REPO_ROOT" ] || die "A and B cannot use the same worktree"
+[ "$BASELINE_WORKTREE" != "$REPO_ROOT" ] || die "A must not run in the dev worktree"
 [ "$(git -C "$BASELINE_WORKTREE" rev-parse HEAD)" = "$BASELINE_SHA" ] \
     || die "A worktree must be exact commit $BASELINE_SHA"
 [ -z "$(git -C "$BASELINE_WORKTREE" status --porcelain)" ] \
     || die "A worktree has local changes; preserve the immutable baseline"
 [ "$(realpath "$(git -C "$REPO_ROOT" rev-parse --git-common-dir)")" = \
   "$(realpath "$(git -C "$BASELINE_WORKTREE" rev-parse --git-common-dir)")" ] \
-    || die "A and B must be worktrees of the same Git repository"
+    || die "A/B/C must be worktrees of the same Git repository"
 
 require_file "$BASELINE_WORKTREE/$CONFIG_PATH"
 require_file "$REPO_ROOT/$CONFIG_PATH"
@@ -135,8 +147,8 @@ def method(path, name):
     return matches[0]
 
 allowed_guard = ast.parse(
-    'if getattr(self, "l1", None) is not None and '
-    'self.last_prompt_tokens + 1024 > self.context_len:\n'
+    'if (getattr(self, "source_background", False)\n'
+    '        and self.last_prompt_tokens + 1024 > self.context_len):\n'
     '    raise RuntimeError("SBAdir exact input tokens exceed checkpoint context reserve")'
 ).body[0]
 
@@ -144,7 +156,7 @@ def remove_one_guard(function):
     matches = [index for index, node in enumerate(function.body)
                if ast.dump(node) == ast.dump(allowed_guard)]
     if len(matches) != 1:
-        raise ValueError("B requires exactly one post-tokenization capacity guard")
+        raise ValueError("B/C require exactly one post-tokenization capacity guard")
     index = matches[0]
     before = function.body[index - 1] if index else None
     after = function.body[index + 1] if index + 1 < len(function.body) else None
@@ -248,23 +260,25 @@ COMMON=(--exp-config "$CONFIG_PATH" --exp-save data --model-name uni-navid
     --l3-min-confidence 0.5 --l3-max-items 2 --l3-max-chars 600
     --l3-scope episode_local)
 if [ -n "$PARENT_MANIFEST" ]; then COMMON+=(--parent-manifest "$PARENT_MANIFEST"); fi
-B_ONLY=(--l1-det-model "$L1_DET_MODEL" --l1-det-device "$L1_DET_DEVICE"
+C_ONLY=(--l1-det-model "$L1_DET_MODEL" --l1-det-device "$L1_DET_DEVICE"
     --l1-det-confidence "$L1_DET_CONFIDENCE"
     --l1-every-n-steps "$L1_EVERY_N_STEPS"
     --l1-place-model "$L1_PLACE_MODEL" --l1-place-device "$L1_PLACE_DEVICE"
     --l1-place-every-n-steps "$L1_PLACE_EVERY_N_STEPS"
     --l1-max-items "$L1_MAX_ITEMS" --l1-max-tokens "$L1_MAX_TOKENS")
 
-info "A: $BASELINE_WORKTREE at $BASELINE_SHA"
-info "B: $REPO_ROOT at $(git -C "$REPO_ROOT" rev-parse HEAD)"
+info "A: $BASELINE_WORKTREE at $BASELINE_SHA (untouched 7602b25, L3 only)"
+info "B: $REPO_ROOT at $(git -C "$REPO_ROOT" rev-parse HEAD) (L3 + source background, no L1)"
+info "C: $REPO_ROOT at $(git -C "$REPO_ROOT" rev-parse HEAD) (L3 + source background + L1)"
 info "Pilot raw SHA256: $PILOT_SHA; Episode canonical SHA256: $EPISODE_SHA"
 info "Habitat config SHA256: $A_CONFIG_SHA; task config SHA256: $A_TASK_SHA"
 info "Checkpoint: $MODEL_PATH; seed: $SEED; temp: 0.2; max_new_tokens: 1024"
-info "Smoke: $OUTPUT_ROOT/smoke_l3_l1_sbadir (frozen manifest shard $SMOKE_SHARD/88)"
+info "Smoke: $OUTPUT_ROOT/$A_SMOKE, $OUTPUT_ROOT/$B_SMOKE, $OUTPUT_ROOT/$C_SMOKE (manifest shard $SMOKE_SHARD/88)"
 info "A output: $OUTPUT_ROOT/$A_NAME"
 info "B output: $OUTPUT_ROOT/$B_NAME"
+info "C output: $OUTPUT_ROOT/$C_NAME"
 if [ "$CONFIRM" != "YES" ]; then
-    info "DRY RUN: set CONFIRM=YES to run one B smoke, then A and B sequentially"
+    info "DRY RUN: set CONFIRM=YES to run three real smokes, then A, B and C sequentially"
     exit 0
 fi
 [ ! -e "$OUTPUT_ROOT" ] || die "output already exists; choose a fresh OUTPUT_ROOT: $OUTPUT_ROOT"
@@ -284,7 +298,7 @@ PYTHONPATH="$REPO_ROOT:$UNINAVID_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
     "$PYTHON_BIN" - "$OUTPUT_ROOT/launch_manifest.json" "$BASELINE_WORKTREE" "$REPO_ROOT" \
     "$MODEL_PATH" "$A_CONFIG_SHA" "$A_TASK_SHA" "$PILOT_SHA" "$EPISODE_SHA" \
     "$PROMPT_SHA" "$CHUNKS" "$SMOKE_SHARD" "$SEG_MODEL" "$L1_DET_MODEL" \
-    "$L1_PLACE_MODEL" "$DATA_PATH" "$SCENES_DIR" <<'PY'
+    "$L1_PLACE_MODEL" "$DATA_PATH" "$SCENES_DIR" "$A_GROUP" "$B_GROUP" "$C_GROUP" <<'PY'
 import json
 import hashlib
 import pathlib
@@ -293,13 +307,13 @@ import sys
 
 (output, baseline, dev, model, config_sha, task_sha, pilot_sha, episode_sha,
  prompt_sha, chunks, smoke_shard, seg_model, l1_det_model, l1_place_model,
- data_path, scenes_dir) = sys.argv[1:]
+ data_path, scenes_dir, a_group, b_group, c_group) = sys.argv[1:]
 def git(path, *args):
     return subprocess.check_output(["git", "-C", path] + list(args), text=True).strip()
 root = pathlib.Path(dev)
 source_paths = [
     "run.py", "agent_uninavid.py", "l3_integration/map_sidecar.py",
-    "l3_integration/sbadir_fusion.py",
+    "l3_integration/sbadir_fusion.py", "l3_integration/experiment_groups.py",
 ]
 source_paths += sorted(str(path.relative_to(root)) for path in (root / "l1_memory").glob("*.py"))
 source_paths += sorted(str(path.relative_to(root)) for path in (root / "l1_integration").glob("*.py"))
@@ -326,7 +340,17 @@ record = {
     "seg_model": seg_model, "l1_det_model": l1_det_model,
     "l1_place_model": l1_place_model,
     "data_path": data_path, "scenes_dir": scenes_dir,
-    "groups": ["l3_organized_baseline_7602b25", "l3_l1_sbadir"],
+    "groups": [a_group, b_group, c_group],
+    "group_names": {
+        a_group: "l3_organized_baseline_7602b25",
+        b_group: "l3_sbadir_source_background_only",
+        c_group: "l3_l1_sbadir",
+    },
+    "smoke_directories": {
+        a_group: "smoke_l3_organized_baseline_7602b25",
+        b_group: "smoke_l3_sbadir_source_background_only",
+        c_group: "smoke_l3_l1_sbadir",
+    },
 }
 pathlib.Path(output).write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 PY
@@ -343,82 +367,48 @@ run_one() {
         --result-path "$output" --split-id "$shard" "$@")
 }
 
+# --- three independent one-Episode smokes before any formal run -----------------
+info "running real one-Episode A smoke"
+mkdir -p "$OUTPUT_ROOT/$A_SMOKE"
+run_one "$BASELINE_WORKTREE" "$A_GROUP" "$OUTPUT_ROOT/$A_SMOKE" "$SMOKE_SHARD" \
+    --split-num 88 2>&1 | tee "$OUTPUT_ROOT/logs/smoke_a.log"
 info "running real one-Episode B smoke"
-mkdir -p "$OUTPUT_ROOT/smoke_l3_l1_sbadir"
-run_one "$REPO_ROOT" uninavid_l3_l1_sbadir \
-    "$OUTPUT_ROOT/smoke_l3_l1_sbadir" "$SMOKE_SHARD" "${B_ONLY[@]}" \
-    --split-num 88 2>&1 | tee "$OUTPUT_ROOT/logs/smoke.log"
-"$PYTHON_BIN" - "$OUTPUT_ROOT/smoke_l3_l1_sbadir/results.jsonl" \
-    "$OUTPUT_ROOT/smoke_l3_l1_sbadir/smoke_validation.json" <<'PY' \
-    || die "B smoke did not complete exactly one real Episode"
-import json
-import pathlib
-import sys
-rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.strip()]
-if len(rows) != 1 or not rows[0].get("scene_basename") or not rows[0].get("episode_id"):
-    raise ValueError("smoke requires one identified Episode result")
-if rows[0].get("official_prompt_sha256") != "435d79868156aaa1352afcd98f4ceae2f03a54f8cdc5fe87e41d32774d5512c1":
-    raise ValueError("smoke did not preserve the official Prompt")
-if rows[0].get("l3_original_memory_unchanged") is not True:
-    raise ValueError("smoke did not preserve original L3 memory")
-if rows[0].get("l1_observation_attempt_steps", 0) <= 0:
-    raise ValueError("smoke did not attempt RGB L1 observation")
-if rows[0].get("l1_observe_error_count", 0) != 0:
-    raise ValueError("smoke encountered L1 observation errors")
-if rows[0].get("l1_detector_error_count", 0) != 0:
-    raise ValueError("smoke encountered L1 detector errors")
-if rows[0].get("l3_segmentation_error_count", 0) != 0:
-    raise ValueError("smoke encountered L3 segmentation errors")
-if rows[0].get("l1_place_error_count", 0) != 0:
-    raise ValueError("smoke encountered DINOv2 place recognition errors")
-if rows[0].get("cross_label_entity_link_error_count", 0) != 0:
-    raise ValueError("smoke encountered cross-sensor entity matcher errors")
-for key in ("l3_map_steps", "l3_fact_count_total", "l1_fact_count_total",
-            "source_background_facts_total", "prompt_has_l1_steps", "prompt_has_l3_steps",
-            "l1_place_attempt_steps", "l1_place_observed_steps"):
-    if rows[0].get(key, 0) <= 0:
-        raise ValueError("smoke did not exercise {} (choose another SMOKE_SHARD)".format(key))
-validation = {
-    "episode": [rows[0]["scene_basename"], rows[0]["episode_id"]],
-    "official_prompt_sha256": rows[0]["official_prompt_sha256"],
-    "l1_observation_attempt_steps": rows[0]["l1_observation_attempt_steps"],
-    "l1_observe_error_count": rows[0]["l1_observe_error_count"],
-    "l1_detector_error_count": rows[0]["l1_detector_error_count"],
-    "l3_segmentation_error_count": rows[0]["l3_segmentation_error_count"],
-    "l1_place_error_count": rows[0]["l1_place_error_count"],
-    "cross_label_entity_link_error_count": rows[0]["cross_label_entity_link_error_count"],
-    "l1_place_attempt_steps": rows[0]["l1_place_attempt_steps"],
-    "l1_place_observed_steps": rows[0]["l1_place_observed_steps"],
-    "l3_map_steps": rows[0].get("l3_map_steps", 0),
-    "l3_frame_unavailable_steps": rows[0].get("l3_frame_unavailable_steps", 0),
-    "l1_fact_count_total": rows[0].get("l1_fact_count_total"),
-    "l3_fact_count_total": rows[0].get("l3_fact_count_total"),
-    "source_background_facts_total": rows[0].get("source_background_facts_total"),
-    "prompt_has_l1_steps": rows[0].get("prompt_has_l1_steps"),
-    "prompt_has_l3_steps": rows[0].get("prompt_has_l3_steps"),
-    "source_injection_observed": bool(rows[0].get("prompt_has_l1_steps", 0)),
-    "l3_original_memory_unchanged": True,
-}
-pathlib.Path(sys.argv[2]).write_text(json.dumps(validation, indent=2) + "\n")
-print("smoke completed", rows[0]["scene_basename"], rows[0]["episode_id"])
-print("L1/L3 facts injected:", rows[0].get("l1_fact_count_total"), rows[0].get("l3_fact_count_total"))
-PY
+mkdir -p "$OUTPUT_ROOT/$B_SMOKE"
+run_one "$REPO_ROOT" "$B_GROUP" "$OUTPUT_ROOT/$B_SMOKE" "$SMOKE_SHARD" \
+    --split-num 88 2>&1 | tee "$OUTPUT_ROOT/logs/smoke_b.log"
+info "running real one-Episode C smoke"
+mkdir -p "$OUTPUT_ROOT/$C_SMOKE"
+run_one "$REPO_ROOT" "$C_GROUP" "$OUTPUT_ROOT/$C_SMOKE" "$SMOKE_SHARD" \
+    --split-num 88 "${C_ONLY[@]}" 2>&1 | tee "$OUTPUT_ROOT/logs/smoke_c.log"
+
+"$PYTHON_BIN" "$REPO_ROOT/scripts/validate_three_group_smoke.py" \
+    --a-dir "$OUTPUT_ROOT/$A_SMOKE" --b-dir "$OUTPUT_ROOT/$B_SMOKE" \
+    --c-dir "$OUTPUT_ROOT/$C_SMOKE" \
+    --a-group "$A_GROUP" --b-group "$B_GROUP" --c-group "$C_GROUP" \
+    || die "real smokes did not complete the three group contracts"
 
 for ((shard=0; shard<CHUNKS; shard++)); do
     info "running A shard $shard/$CHUNKS from protected 7602b25"
     mkdir -p "$OUTPUT_ROOT/$A_NAME"
-    run_one "$BASELINE_WORKTREE" uninavid_l3_only \
-        "$OUTPUT_ROOT/$A_NAME" "$shard" 2>&1 | tee "$OUTPUT_ROOT/logs/${A_NAME}_shard${shard}.log"
+    run_one "$BASELINE_WORKTREE" "$A_GROUP" "$OUTPUT_ROOT/$A_NAME" "$shard" \
+        2>&1 | tee "$OUTPUT_ROOT/logs/${A_NAME}_shard${shard}.log"
 done
 for ((shard=0; shard<CHUNKS; shard++)); do
-    info "running B shard $shard/$CHUNKS"
+    info "running B shard $shard/$CHUNKS (L3 + source background, no L1)"
     mkdir -p "$OUTPUT_ROOT/$B_NAME"
-    run_one "$REPO_ROOT" uninavid_l3_l1_sbadir \
-        "$OUTPUT_ROOT/$B_NAME" "$shard" "${B_ONLY[@]}" \
+    run_one "$REPO_ROOT" "$B_GROUP" "$OUTPUT_ROOT/$B_NAME" "$shard" \
         2>&1 | tee "$OUTPUT_ROOT/logs/${B_NAME}_shard${shard}.log"
 done
+for ((shard=0; shard<CHUNKS; shard++)); do
+    info "running C shard $shard/$CHUNKS (L3 + source background + L1)"
+    mkdir -p "$OUTPUT_ROOT/$C_NAME"
+    run_one "$REPO_ROOT" "$C_GROUP" "$OUTPUT_ROOT/$C_NAME" "$shard" "${C_ONLY[@]}" \
+        2>&1 | tee "$OUTPUT_ROOT/logs/${C_NAME}_shard${shard}.log"
+done
 
-report_args=(--baseline "$OUTPUT_ROOT/$A_NAME" --fused "$OUTPUT_ROOT/$B_NAME"
+report_args=(--baseline "$OUTPUT_ROOT/$A_NAME"
+    --source-background "$OUTPUT_ROOT/$B_NAME"
+    --fused "$OUTPUT_ROOT/$C_NAME"
     --output "$OUTPUT_ROOT" --manifest "$PILOT_MANIFEST"
     --episode-manifest "$EPISODE_MANIFEST" --launch-manifest "$OUTPUT_ROOT/launch_manifest.json")
 if [ -n "$HISTORICAL_RUN_DIR" ]; then report_args+=(--historical "$HISTORICAL_RUN_DIR"); fi

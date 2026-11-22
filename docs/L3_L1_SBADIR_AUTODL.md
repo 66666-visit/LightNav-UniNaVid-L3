@@ -1,27 +1,54 @@
-# L3 与 L1 SBAdir：AutoDL 复现实验
+# L3 三组对照：Organized L3、SBAdir 来源背景、L1 融合
 
-## 代码和来源
+本分支 `experiment/l3-l1-sbadir` 把原来的两组实验（L3 vs L3+L1）扩展为三组：
 
-- **A，冻结基线：** `7602b254ea514aa71b0057e41b5db3bdfedf9ffa` 的独立、干净 Git worktree。当前机器路径为 `/home/lilixing/projects/LightNav-UniNaVid-L3-55-baseline`。脚本直接在该 worktree 运行原始 `run.py`，实验目录名为 `l3_organized_baseline_7602b25`。
-- **B，融合版本：** 从同一提交建立的分支 `experiment/l3-l1-sbadir-7602b25`，当前 worktree 为 `/home/lilixing/projects/LightNav-UniNaVid-L3/tmp/l3-l1-sbadir`。脚本以 `uninavid_l3_l1_sbadir` 运行 B，目录名为 `l3_l1_sbadir`。
-- **名称边界：** `7602b25` 的默认 L3 注入器是 `L3OfficialPromptOrganizer`。本机缺少昨日运行的 `run_config.json`、`console.log`、`results.jsonl` 和 Manifest，所以目前不能独立证明昨日的 49/88 使用了所谓 “Organized” 模式。实验 A 的代码身份由提交 SHA 验证；49/88 须由正式运行复现。
+| 组 | 目录 | `--experiment-group` | 代码来源 | L3 | 来源背景 | L1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| A | `l3_organized_baseline_7602b25` | `uninavid_l3_only` | 独立 `7602b25` worktree | 有 | 无 | 无 |
+| B | `l3_sbadir_source_background_only` | `uninavid_l3_source_background` | 本开发 worktree | 有 | 有 | 无 |
+| C | `l3_l1_sbadir` | `uninavid_l3_l1_sbadir` | 本开发 worktree | 有 | 有 | 有 |
 
-唯一论文是 [IJCAI 2025 的 CONFACT 论文](https://ijcai.org/proceedings/2025/1073)。官方代码已克隆至 `/home/lilixing/projects/references/CONFACT`，commit 为 `05a1227b4821ebf1b843f0ce5824f9420006cfdb`。`main.py` 的 `Augment_w_Media()` 将来源背景附到检索证据；`method/prompt_processor.py` 把每条证据与其背景相邻呈现；`inference.py` 执行生成后的 Prompt。SBAdir 本身没有冲突判决器。该仓库未提供 LICENSE，因此本项目独立实现事实与来源相邻呈现的思路，没有复制 CONFACT 源码、媒体可信度预测或 RAG 系统。
+- **A** 严格运行 `7602b254ea514aa71b0057e41b5db3bdfedf9ffa`：直接执行未改动的基线 worktree（其 `run.py` / `agent_uninavid.py` / `l3_memory` 保持 `7602b25` 原字节）；Prompt 只有原始 instruction + L3 Organized 文本。
+- **B** 只启用 L3。它调用**同一个** `compose_sbadir`，但 `l1_facts=()`、`l1_backend=None`，因此不会加载 YOLO 检测权重或 DINOv2，也不产生任何 L1 事实。L3 事实集合、顺序、句子来自冻结的 `7602b25` organizer，不做重写、筛选或重排。
+- **C** 在 B 的 L3 事实与来源背景之上增加 L1 RGB 记忆；L1 事实同样逐条配对真实来源。同实体冲突保留双方事实、共同实体 ID 与双方证据 ID，不判决哪一方正确。
 
-L1 算法来自 LightNav-0-codex 的 `6aefffada23de3d4edd422c3c9289182067dbad2`，许可为 Apache-2.0。迁移模块为 `l1_memory/{memory_writer,local_graph_fusion,local_graph_config,l1_prompt_organizer,yolo_scene_extractor,place_recognition,working_memory,episodic_memory,scene_graph}.py`；`compat.py` 是 Python 3.8 兼容辅助文件。`l1_integration/sbadir_backend.py` 连接 Habitat RGB、原始 `MemoryWriter`、现有 `V3MemoryStore`、DINOv2 地点历史、`L1PromptOrganizer` 和 `LocalGraphFusion`。每个被选中的检测事实保留实际检测置信度、观察步、标签、证据 ID、检测器名、RGB 输入来源和可用检测框。逐文件 SHA256 见 `l1_memory/provenance.json`。
+## 公平性约束
 
-**动作接口边界：** UniNaVid 在本实验中返回 Habitat 离散动作 `0/1/2/3`，L1 收到的是实际上一动作 `{"action": n}`。原始 `MemoryWriter._has_forward_command()` 仅把带 `action_args.linear_velocity` 的 `velocity_control` 识别为速度前进命令，因此其速度控制驱动的语义转移分支不会在这里触发。没有把离散动作伪装成速度测量。RGB 检测、外观变化、DINOv2 地点描述、证据写入以及 L1 历史检索仍按实际观察执行；此处不能宣称获得了该速度分支所推断的地点转移。
+1. B 和 C 的 L3 原始事实必须一致；C 只允许在原始事实句子后追加相同来源背景，再追加 L1 行。
+2. A、B、C 使用同一份 88 Episode Manifest、同一 checkpoint、同一 seed 42、同一 Habitat 配置、同一推理参数（temperature 0.2、max_new_tokens 1024）。
+3. 三组都只使用 UniNaVid 官方 Prompt 的任务槽；不增加 System/User 角色、特殊 Token 或第二套 Prompt。视觉 Token 顺序、任务指令、动作解码与生成参数不变。
+4. 来源背景只使用实际存在的字段：L3 为 segmentation 来源、map node ID、观察步、segmentation 置信度、evidence ID；L1 为 detector 名、RGB 输入来源、观察步、检测置信度、evidence ID、可选的 DINOv2 visual place 来源与 evidence ID。缺失字段写 `unavailable`，不编造。
+5. 来源背景不是传感器可信度评分；实现中没有可信度预测模型。
 
-融合仅写入 UniNaVid 官方 Prompt 的原有任务槽，且只格式化一次。L3 原始事实句子由冻结的 L3 组织器产生；B 在句子后附观测来源，随后以逐条标注的 L1 事实使用剩余 Token。相同事实合并重复的对象标签断言，互补事实保留，确认同一实体同一属性但值不同的事实保留两方原始值与证据 ID；身份不确定时不作强制匹配。来源字段不是传感器可信度分数。
+## 来源背景与冲突
+
+`l3_integration/sbadir_fusion.py` 的 `compose_sbadir()` 保留全部 L3 原始行，并在每行末尾追加：
+
+```text
+[L3 RGB-D map; source ...; map node ...; geometry observed|unverified; step N;
+ seg conf x.xx; evidence ...]
+```
+
+L1 行形如：
+
+```text
+L1 RGB fact: ...; same map entity <object_id>; L3 reports <label>; both retained
+[L1 RGB observation; source ...; RGB input observation.rgb; step N;
+ detector conf x.xx; evidence ...]
+```
+
+只有同一帧内 mask/bbox 唯一重叠验证或 L3 组织器已记录的 `linked_l1_evidence_ids` 才会被视为共同实体。冲突时双方原始值与双方 evidence ID 都进入 Prompt 和 `conflict_evidence_ids`，`resolution="both_retained"`。
 
 ## AutoDL 准备
 
-1. 将本机 `/home/lilixing/projects/LightNav-UniNaVid-L3/tmp/l3-l1-sbadir-delivery.tar.gz` 及同名 `.sha256` 文件传到 AutoDL；先在归档所在目录执行 `sha256sum -c l3-l1-sbadir-delivery.tar.gz.sha256`。在 AutoDL 的同一 Git 仓库中，从 `7602b25` 建立**干净且独立**的 A worktree，并从同一提交建立 B 开发 worktree，然后在 B worktree 根目录执行 `tar -xzf /path/to/l3-l1-sbadir-delivery.tar.gz`。该归档只包含相对代码、测试和文档路径，不包含 `.git`；不要解压到 A。无须 Git commit 或 push。
-2. 在 AutoDL 准备官方 UniNaVid 包和 checkpoint。`UNINAVID_ROOT` 应是包含 `uninavid/model/builder.py` 的**父目录**；A worktree 本身没有被 Git 跟踪的 `uninavid` 符号链接。
-3. 准备本地 `yolo11n-seg.pt`、L1 的检测任务 `.pt`、DINOv2-Small 本地模型目录（含 `config.json`、`preprocessor_config.json` 和权重）、冻结 Pilot 与 Episode Manifest、Habitat 数据集及场景。`DATA_PATH` 和 `SCENES_DIR` 必须解析到 Habitat task YAML 实际加载的路径。
-4. 选一个全新且不存在的 `OUTPUT_ROOT`。脚本拒绝覆盖旧输出。`HISTORICAL_RUN_DIR` 可指向昨日 `.../uninavid_l3_only/`；提供时应包含 `run_config.json`、`console.log`、`results.jsonl` 与 `execution_manifest.json`。
+1. 将本分支代码同步到 AutoDL 后，从 `7602b25` 建立**干净、独立**的 A worktree（不要解压到 A），本分支 worktree 作为 B/C 开发 worktree。A worktree 必须无本地改动。
+2. 准备官方 UniNaVid 包（`UNINAVID_ROOT` 是包含 `uninavid/model/builder.py` 的父目录）、checkpoint、`yolo11n-seg.pt`、L1 检测 `.pt`、DINOv2-Small 本地目录、冻结 Pilot/Episode Manifest、Habitat 数据与场景、`uninavid` 官方依赖。
+3. `DATA_PATH` 与 `SCENES_DIR` 必须解析到 Habitat task YAML 实际加载的路径。
+4. 选择全新且不存在的 `OUTPUT_ROOT`；脚本拒绝覆盖旧输出。可选 `HISTORICAL_RUN_DIR` 指向历史 L3 结果目录。
 
-在 B worktree 内执行下面**一条命令**，将占位路径替换成 AutoDL 上的实际路径：
+## 一条命令运行
+
+在 B/C 开发 worktree 根目录执行：
 
 ```bash
 CONFIRM=YES \
@@ -35,25 +62,100 @@ L1_DET_MODEL=/path/to/yolo11n-detect.pt \
 L1_PLACE_MODEL=/path/to/dinov2-small \
 DATA_PATH=/path/to/Habitat-configured/val_unseen.json.gz \
 SCENES_DIR=/path/to/Habitat-configured/scenes \
-OUTPUT_ROOT=/path/to/new/l3_vs_l3l1_run \
+OUTPUT_ROOT=/path/to/new/l3_three_group_run \
 PYTHON_BIN=/path/to/python3.8 \
 GPU_ID=0 CHUNKS=1 SMOKE_SHARD=0 \
 bash scripts/run_l3_vs_l3l1.sh
 ```
 
-可选环境变量：`HISTORICAL_RUN_DIR`、`PARENT_MANIFEST`、`CONFIG_PATH`（相对于 A/B 两个 worktree 的同一路径）、`SEG_DEVICE`、`L1_DET_DEVICE`、`L1_PLACE_DEVICE`、`L1_DET_CONFIDENCE`、`L1_EVERY_N_STEPS`、`L1_PLACE_EVERY_N_STEPS`、`L1_MAX_ITEMS` 和 `L1_MAX_TOKENS`。正式配对固定 seed 42、L3 最多两条/600 字符、temperature 0.2、max_new_tokens 1024。Pilot 原文件 SHA256 固定为 `cf1755261b5d5bba6910e74b47e52cc2d6506a3e2edd79fa0012e691f6c7a04a`；Episode Manifest 规范 SHA256 固定为 `30260e81e98a0f368cc214b095d9f1c4c43a65e7332e2dc6d7f89e80ae9eac98`。
+执行顺序由脚本强制保证：
 
-脚本先核对 A 的提交及干净状态、A/B 配置和 L3 核心源码、官方 Prompt 固定文字与视觉/生成方法、Manifest、数据集与场景；随后只跑 **B 的一个真实 Episode GPU Smoke**。Smoke 要求 L1 检测、DINOv2 地点观测、L3 地图更新、L1/L3 事实和来源背景实际注入且没有检测/地点/分割错误。所选 Episode 没有可注入事实时，脚本停止；可用 `SMOKE_SHARD=0..87` 选择另一条冻结 Manifest Episode。Smoke 通过后，脚本顺序执行完整 A 和 B，每次只占用同一 GPU；按 `(scene_basename, episode_id)` 配对，与 Habitat reset 次序无关。
+1. A、B、C 各跑一个**真实 Episode smoke**（同一冻结 Manifest shard，默认 0/88）。
+2. 三个 smoke 全部通过各自契约后才开始正式运行。
+3. 正式运行 A（基线 worktree）→ B（本 worktree，不带任何 `--l1-*` 参数）→ C（本 worktree，带 L1 参数）。
+4. 自动调用 `scripts/build_l3_l1_report.py` 生成三组配对报告。
 
-## 输出与核验
+可选环境变量：`HISTORICAL_RUN_DIR`、`PARENT_MANIFEST`、`CONFIG_PATH`（相对两个 worktree 的同路径）、`SEG_DEVICE`、`L1_DET_DEVICE`、`L1_PLACE_DEVICE`、`L1_DET_CONFIDENCE`、`L1_EVERY_N_STEPS`、`L1_PLACE_EVERY_N_STEPS`、`L1_MAX_ITEMS`、`L1_MAX_TOKENS`。固定 seed 42、L3 最多两条/600 字符、temperature 0.2、max_new_tokens 1024。
 
-运行目录互不覆盖：
+## 输出
 
-- `OUTPUT_ROOT/smoke_l3_l1_sbadir/`：单 Episode 结果和 `smoke_validation.json`。
-- `OUTPUT_ROOT/l3_organized_baseline_7602b25/`：实际 `7602b25` 代码的 A 结果。
-- `OUTPUT_ROOT/l3_l1_sbadir/`：B 结果，逐步 `steps.jsonl` 记录原始 L3 句子、来源背景、L1 证据和冲突证据 ID。
-- `OUTPUT_ROOT/summary.json`、`results.jsonl`、`comparison.csv`、`paired_episode_deltas.csv`、`final_report.md`：88 个身份配对 Episode 的 SR、SPL、nDTW、NE、OSR、TL、延迟、Prompt Tokens、事实及冲突比较。
+```text
+OUTPUT_ROOT/
+  smoke_l3_organized_baseline_7602b25/
+  smoke_l3_sbadir_source_background_only/
+  smoke_l3_l1_sbadir/
+  l3_organized_baseline_7602b25/      # A 原始 run_config.json + results.jsonl + steps.jsonl
+  l3_sbadir_source_background_only/   # B
+  l3_l1_sbadir/                       # C
+  launch_manifest.json
+  summary.json
+  results.jsonl                       # 三组源结果，带 comparison_group
+  comparison.csv                      # A vs B、B vs C、A vs C
+  paired_episode_deltas.csv           # 按 (scene_basename, episode_id) 配对
+  final_report.md
+```
 
-报告验证 A 是否得到 49/88；未得到时明确标记历史基线未复现。即使 A 得到 49/88，在昨日原始工件缺失时，报告仍将昨日结果标为未独立核实。L3 不变性通过 A/B 核心文件字节相等、官方视觉/生成代码等价、B 每步原始 L3 文本 SHA256，以及每条原始 L3 事实句子在 B Prompt 中逐字保留来检查。若导航动作分叉，后续 RGB-D 历史不同，不能把不同观测条件下的 L3 文本强行逐步判为相同。
+`summary.json` 中的 `comparisons` / `paired` 分别含 `a_vs_b`、`b_vs_c`、`a_vs_c`；指标含 SR、SPL、nDTW、NE、OSR、TL、平均步数、推理耗时、Prompt Tokens、事实数、冲突数与来源配对事实数。
 
-本机 Python 3.8 CPU 回归测试通过 146 项，覆盖 L1 RGB 事实、来源字段、重复/冲突/不确定匹配、Token 预算、L3 原始文本和报告校验。另有三个依赖 `torch` 的测试文件未在此环境运行。本机 Python 3.8 环境缺少 Habitat、torch、transformers、ultralytics，且没有真实 checkpoint 和上述冻结 Manifest，故尚无真实 Episode Smoke 或 88 Episode 结果；在 AutoDL 完成前，报告文件及其指标尚不存在。
+## 如何确认 B 没有偷偷启用 L1
+
+报告在写文件前会做以下校验，任一不满足都会 `ValueError` 终止：
+
+1. `l3_sbadir_source_background_only/run_config.json`：`"l1": null`，且 `"source_background": {"enabled": true, "fusion": "evidence_source_pairing"}`。
+2. B 每条结果：`l1_fact_count_total == 0`、`l1_retained_facts_total == 0`、`prompt_has_l1_steps == 0`、`l1_enabled_steps == 0`、`l1_observation_attempt_steps == 0`。
+3. B 每条结果：`source_background_facts_total == l3_fact_count_total`，且 `l3_original_memory_unchanged is True`。
+4. 启动脚本：B 不传任何 `--l1-*`；`run.py` 的 `validate_model_paths()` 对 B 收到任何 L1 权重路径直接报错。
+5. 人工复核：
+
+```bash
+python - <<'PY'
+import json
+cfg = json.load(open("OUTPUT_ROOT/l3_sbadir_source_background_only/run_config.json"))
+print("B l1 config:", cfg.get("l1"))
+rows = [json.loads(l) for l in open("OUTPUT_ROOT/l3_sbadir_source_background_only/results.jsonl")]
+print("B l1 facts:", sum(r["l1_fact_count_total"] for r in rows))
+print("B l1 prompt steps:", sum(r["prompt_has_l1_steps"] for r in rows))
+print("B L1 observation steps:", sum(r["l1_observation_attempt_steps"] for r in rows))
+assert cfg.get("l1") is None
+assert all(r["l1_fact_count_total"] == 0 for r in rows)
+assert all(r["prompt_has_l1_steps"] == 0 for r in rows)
+PY
+```
+
+B 的每次 prompt 也写入 `steps.jsonl` 的 `sbadir_memory_text`；其中只应出现 `L3 RGB-D map` 来源块，不出现 `L1 RGB observation`。
+
+## 如何确认 C 的 L3 内容没有被改变
+
+1. **源码层**：报告要求 A worktree 与 B/C worktree 的 `l3_integration/official_prompt.py`、`l3_integration/habitat_geometry.py`、`l3_memory/*.py` 逐字节相同；`agent_uninavid.py` 的视觉编码与生成方法 AST 与基线相同（仅允许一条已声明的 context 容量保护）。
+2. **运行层**：B/C 每条注入 L3 的 step 记录 `l3_original_sha256`；报告重新计算 `step["l3_context_text"]` 的 SHA256 并要求一致。
+3. **逐行层**：报告要求每个原始 L3 行都是 B/C prompt 中某一行的前缀，且顺序正确；不允许多余/缺失/重复。
+4. **状态层（与动作轨迹无关）**：在动作首次分叉之前的每个共同 step，比较 L3 观测与检索状态：`frame_valid`、`segmentation_count`、`evidence_minted`、`observed_objects`、`object_nodes`、`viewpoints`、`observed_from_edges`、`traversed_to_edges`、`context_available`、`candidate_count`、`verified_count`、`unverified_count`、`current_only_skipped`、`omitted_items`、`fact_count`。即使 C 因为有 L1 而在第 0 步就改变动作，第 0 步的 L3 状态仍必须与 B 相同。
+5. **A/B/C 配对层**：在动作首次分叉之前的共同 action prefix 上，A 与 B、B 与 C、A 与 C 的 `l3_context_text` 必须逐字节相同；B 与 C 还必须在 `l3_enriched_sha256`（原始事实 + 来源背景）上逐字节相同。动作分叉后 RGB-D 历史不同，报告不强行逐步比较。
+6. **事实签名**：每个注入 step 记录 `l3_fact_signature_sha256`（object_id、label、evidence_ids、原始句子），B/C 在共同前缀上必须一致。
+
+人工复核：
+
+```bash
+python - <<'PY'
+import json
+def rows(name):
+    return { (r["scene_basename"], r["episode_id"]): r
+             for r in map(json.loads, open(f"OUTPUT_ROOT/{name}/results.jsonl")) }
+a = rows("l3_organized_baseline_7602b25")
+b = rows("l3_sbadir_source_background_only")
+c = rows("l3_l1_sbadir")
+assert set(a) == set(b) == set(c)
+assert len(a) == 88
+for key in a:
+    assert a[key]["instruction_sha256"] == b[key]["instruction_sha256"] == c[key]["instruction_sha256"]
+    assert a[key]["episode_seed"] == b[key]["episode_seed"] == c[key]["episode_seed"]
+print("88 paired identities OK")
+PY
+```
+
+## 本机验证状态
+
+- 本机 Python 3.8 CPU 回归：`175 passed`（排除需要 torch 的 `test_agent_contract.py`、`test_prompt_audit.py`、`test_prompt_tokens.py`）。
+- 新增 `tests/test_three_group_experiment.py`：覆盖 A 无来源背景、B 无 L1、B L3 事实与来源、C 复用 B 的 L3 文本/来源背景、C 增加 L1、同实体冲突双方保留、冲突 ID 进入 Prompt、官方 Prompt 快照、Python 3.8 兼容，并用 `tests/sbadir_agent_probe.py` 在 CPU 上真实调用 agent 的 `act()` 验证 B/C。
+- 新增 `tests/test_launcher_smoke_validator.py`：验证正式运行前的三组 smoke 门禁；`scripts/validate_three_group_smoke.py` 被启动脚本直接调用。
+- 本机没有 Habitat/torch/真实 checkpoint/冻结 Manifest，未执行正式 GPU 实验，也没有真实 88 Episode 结果；上述运行路径和命令供 AutoDL 执行。

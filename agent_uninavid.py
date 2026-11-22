@@ -12,6 +12,7 @@ import imageio
 from habitat.utils.visualizations import maps
 import random
 
+from l3_integration.experiment_groups import ALL_GROUPS, spec as group_spec
 from l3_integration.official_prompt import (
     REFERENCE_OFFICIAL_PROMPT_SHA256,
     build_prompt,
@@ -58,13 +59,26 @@ def _preserve_rng_state():
 class UniNaVid_Agent(Agent):
     def __init__(self, model_path, result_path, exp_save, l3_sidecar=None,
                  env=None, config=None, experiment_group="uninavid_baseline",
-                 l1_backend=None, l1_max_tokens=160):
+                 l1_backend=None, l1_max_tokens=160, source_background=False):
         
         print("Initialize UniNaVid")
 
+        if experiment_group in ALL_GROUPS:
+            frozen = group_spec(experiment_group)
+            if bool(source_background) != frozen.source_background:
+                raise ValueError(
+                    "source_background does not match frozen group " + experiment_group
+                )
+            if (l1_backend is not None) != frozen.uses_l1:
+                raise ValueError(
+                    "L1 backend presence does not match frozen group " + experiment_group
+                )
         self.l3 = l3_sidecar
         self.l1 = l1_backend
         self.l1_max_tokens = l1_max_tokens
+        #: B enables only the SBAdir evidence/source pairing; C enables it too
+        #: and additionally carries the L1 RGB memory.
+        self.source_background = bool(source_background)
         self.env = env
         self.config = config
         self.experiment_group = experiment_group
@@ -100,7 +114,7 @@ class UniNaVid_Agent(Agent):
         
         self.promt_template = "Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations and an image of the current observation <image>. Your assigned task is: '{}'. Analyze this series of images to determine your next four actions. The predicted action should be one of the following: forward, left, right, or stop."
         self.prompt_template_sha256 = prompt_sha256(self.promt_template)
-        if self.l1 is not None and self.prompt_template_sha256 != REFERENCE_OFFICIAL_PROMPT_SHA256:
+        if self.source_background and self.prompt_template_sha256 != REFERENCE_OFFICIAL_PROMPT_SHA256:
             raise RuntimeError("SBAdir requires the unchanged official Uni-NaVid prompt")
 
         # self.history_rgb_tensor = None
@@ -184,7 +198,7 @@ class UniNaVid_Agent(Agent):
             new_list.append(token_prompt)
         input_ids = torch.cat(new_list, dim=0).unsqueeze(0)
         self.last_prompt_tokens = int(input_ids.shape[1])
-        if (getattr(self, "l1", None) is not None
+        if (getattr(self, "source_background", False)
                 and self.last_prompt_tokens + 1024 > self.context_len):
             raise RuntimeError("SBAdir exact input tokens exceed checkpoint context reserve")
 
@@ -481,11 +495,18 @@ class UniNaVid_Agent(Agent):
 
 
     def _augment_sbadir_task_text(self, instruction, step, diagnostic):
-        """Add L1 and source records inside the same official task slot."""
-        backend = self.l1
-        sidecar = self.l3
-        if backend is None or sidecar is None:
-            raise RuntimeError("SBAdir requires both real L1 and L3 backends")
+        """Pair L3 facts (and optionally L1 facts) with their real sources.
+
+        B passes ``l1=None`` and therefore feeds an empty L1 fact list into the
+        same ``compose_sbadir`` code path used by C.  The L3 organizer is read
+        once; its facts, order and text are never rewritten.
+        """
+        backend = getattr(self, "l1", None)
+        sidecar = getattr(self, "l3", None)
+        if sidecar is None:
+            raise RuntimeError("source background requires the real L3 sidecar")
+        if backend is not None and not self.source_background:
+            raise RuntimeError("an L1 backend requires the source-background mode")
         if not isinstance(instruction, str):
             raise ValueError("instruction must be text")
         with _preserve_rng_state():
@@ -503,13 +524,13 @@ class UniNaVid_Agent(Agent):
         self.last_l3_context_text = l3_context
         l1_facts = ()
         selection = None
-        if getattr(backend, "last_step", None) == step:
+        if backend is not None and getattr(backend, "last_step", None) == step:
             with _preserve_rng_state():
                 selection = backend.select(step=step, rgb_width=int(self.rgb_list[-1].shape[1]))
             l1_facts = selection.selected_facts
             diagnostic["l1_selection"] = selection.diagnostics
             diagnostic["l1_fact_records"] = [fact.to_dict() for fact in l1_facts]
-        else:
+        elif backend is not None:
             diagnostic["l1_selection_error"] = "L1 observation unavailable at this step"
 
         def count_tokens_strict(value):
@@ -528,7 +549,7 @@ class UniNaVid_Agent(Agent):
             l3_text=l3_context, l3_facts=l3_facts, l1_facts=l1_facts,
             count_tokens=count_tokens_strict,
             max_prompt_tokens=capacity,
-            l1_max_tokens=self.l1_max_tokens,
+            l1_max_tokens=getattr(self, "l1_max_tokens", 160),
             entity_links=sidecar.cross_sensor_links,
         )
         if fused.diagnostics["omitted_l3_provenance"]:
@@ -596,7 +617,7 @@ class UniNaVid_Agent(Agent):
             row["prompt_text"] = prompt_text
             row["task_text"] = self.last_task_text
             row["l3_context_text"] = self.last_l3_context_text
-            if getattr(self, "l1", None) is not None:
+            if getattr(self, "source_background", False):
                 row["sbadir_memory_text"] = self.last_sbadir_memory_text
         row.setdefault("l3_enabled", getattr(self, "l3", None) is not None)
         row.setdefault("context_injected", False)
@@ -617,7 +638,7 @@ class UniNaVid_Agent(Agent):
         if prompt_tokens is not None:
             self.prompt_token_counts.append(int(prompt_tokens))
         self.step_index += 1
-        if getattr(self, "l1", None) is not None:
+        if getattr(self, "source_background", False):
             self.last_action = {"action": action}
 
 
@@ -692,14 +713,15 @@ class UniNaVid_Agent(Agent):
             "l3_map_summary": map_summary,
             "official_prompt_sha256": getattr(self, "prompt_template_sha256", None),
         }
-        if getattr(self, "l1", None) is not None:
+        if getattr(self, "source_background", False):
+            backend_present = getattr(self, "l1", None) is not None
             prompt_rows = [row for row in rows if row.get("prompt_tokens") is not None]
             l1_rows = [row for row in rows if row.get("l1_enabled")]
             aggregate_keys = (
                 "l1_fact_count", "l1_retained_facts", "l1_omitted_facts",
                 "duplicated_facts", "conflicting_facts", "retained_facts",
                 "omitted_facts", "source_background_facts",
-                "uncertain_entity_matches",
+                "l3_provenance_count", "uncertain_entity_matches",
             )
             totals = {
                 key + "_total": sum(int(row.get(key, 0) or 0) for row in prompt_rows)
@@ -707,8 +729,11 @@ class UniNaVid_Agent(Agent):
             }
             summary.update(totals)
             summary.update({
+                "source_background_enabled": True,
+                "l1_enabled": backend_present,
                 "l1_fact_count_total": totals["l1_retained_facts_total"],
                 "prompt_has_l1_steps": sum(bool(row.get("prompt_has_l1")) for row in prompt_rows),
+                "l1_enabled_steps": sum(bool(row.get("l1_enabled")) for row in rows),
                 "l1_observation_attempt_steps": len(l1_rows),
                 "l1_observe_error_count": sum(bool(row.get("l1_observe_error")) for row in l1_rows),
                 "l1_detector_error_count": sum(bool(row.get("l1_detector_error")) for row in l1_rows),
@@ -789,7 +814,7 @@ class UniNaVid_Agent(Agent):
             return {"action": temp_action}
 
 
-        if getattr(self, "l1", None) is not None:
+        if getattr(self, "source_background", False):
             task_text, l3_context, l3_diagnostic = self._augment_sbadir_task_text(
                 instruction, step, l3_diagnostic,
             )

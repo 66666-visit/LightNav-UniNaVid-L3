@@ -24,6 +24,11 @@ from l3_integration.episode_execution import (
     metadata_from_execution_manifest,
     metadata_from_pilot_manifest,
 )
+from l3_integration.experiment_groups import (
+    ALL_GROUPS,
+    spec as group_spec,
+    validate_model_paths,
+)
 from l3_integration.pilot_manifest import (
     EXPECTED_EPISODES,
     EXPECTED_EPISODE_MANIFEST_SHA256,
@@ -142,7 +147,7 @@ def main():
     )
     parser.add_argument(
         "--experiment-group",
-        choices=("uninavid_baseline", "uninavid_l3_only", "uninavid_l3_l1_sbadir"),
+        choices=("uninavid_baseline",) + ALL_GROUPS,
         default="uninavid_baseline",
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -283,14 +288,12 @@ def run_exp(exp_config: str, split_num: int, split_id: int, model_path: str,
         raise ValueError("split-id must lie in [0, split-num)")
     if l3_scope != "episode_local":
         raise ValueError("L3 may not persist across Episodes; use episode_local")
-    if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"} and not l3_seg_model:
-        raise ValueError("L3 groups require --l3-seg-model")
-    if experiment_group == "uninavid_l3_l1_sbadir" and (not l1_det_model or not l1_place_model):
-        raise ValueError("SBAdir requires --l1-det-model and --l1-place-model")
-    if experiment_group != "uninavid_l3_l1_sbadir" and (l1_det_model or l1_place_model):
-        raise ValueError("only the SBAdir group may receive L1 model paths")
-    if experiment_group == "uninavid_baseline" and l3_seg_model:
-        raise ValueError("baseline group must not receive an L3 segmentation model")
+    validate_model_paths(
+        experiment_group if experiment_group in ALL_GROUPS else "uninavid_baseline",
+        l3_seg_model=l3_seg_model,
+        l1_det_model=l1_det_model,
+        l1_place_model=l1_place_model,
+    )
     if experiment_group != "uninavid_baseline" and model_name != "uni-navid":
         raise ValueError("the L3 experiment groups are only defined for uni-navid")
     if model_name == "uni-navid" and not allow_nonpilot_eval:
@@ -583,7 +586,7 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
                    exp_config: str = "",
                    allow_nonpilot_eval: bool = False) -> None:
 
-    if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"} and model_name != "uni-navid":
+    if experiment_group in ALL_GROUPS and model_name != "uni-navid":
         raise ValueError("L3 groups are only defined for uni-navid")
     if (
         experiment_group == "uninavid_baseline"
@@ -591,6 +594,13 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
         and l3_options.get("seg_model")
     ):
         raise ValueError("baseline group must not receive an L3 segmentation model")
+    scripted = group_spec(experiment_group) if experiment_group in ALL_GROUPS else None
+    if (scripted is not None and not scripted.uses_l1
+            and isinstance(l1_options, dict)
+            and (l1_options.get("det_model") or l1_options.get("place_model"))):
+        raise ValueError(
+            "group {} must not receive L1 model paths".format(experiment_group)
+        )
 
     if episode_metadata is None and execution_manifest is not None:
         episode_metadata = metadata_from_execution_manifest(execution_manifest)
@@ -599,13 +609,15 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
     l3_sidecar = None
     camera_spec = None
     l3_config = None
-    if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"}:
+    if experiment_group in ALL_GROUPS and group_spec(experiment_group).uses_l3:
         l3_sidecar, camera_spec, l3_config = _build_l3_sidecar(
             config, l3_options or {},
         )
     l1_backend = None
-    if experiment_group == "uninavid_l3_l1_sbadir":
+    if scripted is not None and scripted.uses_l1:
         l1_backend = _build_l1_backend(l1_options or {})
+    if scripted is not None and l1_backend is not None and not scripted.source_background:
+        raise ValueError("L1 is only defined together with source background")
 
     if model_name == "navid":
         from agent_navid import NaVid_Agent
@@ -613,12 +625,13 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
 
     elif model_name == "uni-navid":
         from agent_uninavid import UniNaVid_Agent
-        if experiment_group in {"uninavid_l3_only", "uninavid_l3_l1_sbadir"}:
+        if scripted is not None:
             agent = UniNaVid_Agent(
                 model_path, result_path, exp_save, l3_sidecar=l3_sidecar,
                 l1_backend=l1_backend,
                 l1_max_tokens=(l1_options or {}).get("max_tokens", 160),
                 env=env, config=config, experiment_group=experiment_group,
+                source_background=scripted.source_background,
             )
         else:
             agent = UniNaVid_Agent(
@@ -634,6 +647,21 @@ def evaluate_agent(config, split_id, dataset, model_path, result_path, model_nam
     )
     run_metadata = {
         "group": experiment_group,
+        "group_name": scripted.name if scripted is not None else None,
+        "source_background": {
+            "enabled": bool(scripted is not None and scripted.source_background),
+            "fusion": (
+                "evidence_source_pairing"
+                if scripted is not None and scripted.source_background else None
+            ),
+            "l3_organized_facts_preserved": (
+                bool(scripted is not None and scripted.source_background)
+            ),
+            "source_tree_sha256": (
+                os.environ.get("SBADIR_SOURCE_SHA256")
+                if scripted is not None and scripted.source_background else None
+            ),
+        },
         "model_name": model_name,
         "model_path": str(Path(model_path).expanduser()),
         "exp_config": str(Path(exp_config).expanduser()) if exp_config else "",
